@@ -1,0 +1,148 @@
+use std.test {assert-eq assert-true test summarize}
+use std.http :as http
+use std.env :as env
+use neo4irij :as neo
+
+;; Against a real server. Skipped unless NEO4J_URI is set, e.g.
+;;
+;;   docker run -d --rm -p 7474:7474 -e NEO4J_AUTH=neo4j/password123 neo4j:latest
+;;   NEO4J_URI=http://localhost:7474 NEO4J_USERNAME=neo4j NEO4J_PASSWORD=password123 irij test
+;;
+;; Writes only nodes labelled :Neo4irijTest, and deletes them.
+
+fn clean :: neo.Conn () ::: neo.Neo4j
+  => conn
+  neo.execute conn "MATCH (n:Neo4irijTest) DETACH DELETE n" {}
+  ()
+
+fn caught :: (Fn):eff _ ::: eff
+  => thunk
+  match (try thunk)
+    Ok v => error ~ "expected a failure, got " ++ to-str v
+    Err e => e
+
+fn run-info :: neo.Conn () ::: neo.Neo4j
+  => conn
+  i := neo.info conn
+  assert-true (contains? i "neo4j_version")
+
+fn run-params-round-trip :: neo.Conn () ::: neo.Neo4j
+  => conn
+  v := {s= "héllo" i= 9223372036854775807 f= 0.1 b= true nul= () xs= #[1 "two" #[3]] m= {k= 2}}
+  assert-eq v (neo.scalar conn "RETURN $v AS v" {v= v})
+  assert-eq "kw" (neo.scalar conn "RETURN $v AS v" {v= :kw})
+  assert-eq 0.5 (neo.scalar conn "RETURN $v AS v" {v= 1/2})
+  assert-eq #[1 2] (neo.scalar conn "RETURN $v AS v" {v= #(1 2)})
+
+fn run-tagged-round-trip :: neo.Conn () ::: neo.Neo4j
+  => conn
+  d := neo.date "2024-05-06"
+  assert-eq d (neo.scalar conn "RETURN $v AS v" {v= d})
+  assert-eq "2025-05-06" (neo.scalar conn "RETURN toString($v + duration('P1Y')) AS v" {v= d})
+  du := neo.duration "P1DT2H"
+  assert-eq du (neo.scalar conn "RETURN $v AS v" {v= du})
+  z := neo.datetime "2024-05-06T10:00:00+02:00[Europe/Berlin]"
+  assert-eq z (neo.scalar conn "RETURN $v AS v" {v= z})
+  p := neo.wgs84 13.4 52.5
+  assert-eq 13.4 (neo.scalar conn "RETURN $v.longitude AS v" {v= p})
+  assert-eq "Date" (neo.scalar conn "RETURN date('2020-01-01') AS v" {}).kind
+
+fn run-graph-entities :: neo.Conn () ::: neo.Neo4j
+  => conn
+  clean conn
+  c := neo.execute conn "CREATE (:Neo4irijTest:Person {name: 'Ada'})-[:KNOWS {since: 1843}]->(:Neo4irijTest:Person {name: 'Charles'})" {}
+  assert-eq 2 (get "nodes-created" c)
+  assert-eq 1 (get "relationships-created" c)
+  row := neo.single conn "MATCH p = (a:Neo4irijTest {name: 'Ada'})-[r:KNOWS]->(b) RETURN a, r, b, p" {}
+  a := get "a" row
+  r := get "r" row
+  b := get "b" row
+  assert-eq "Node" (type-of a)
+  assert-true (contains? a.labels "Person")
+  assert-eq "Ada" (get "name" a.props)
+  assert-eq "KNOWS" r.type
+  assert-eq 1843 (get "since" r.props)
+  assert-eq a.id r.start
+  assert-eq b.id r.end
+  path := get "p" row
+  assert-eq #["Ada" "Charles"] (path.nodes |> @ (n -> get "name" n.props))
+  assert-eq 1 (length path.rels)
+  clean conn
+
+fn run-transaction-commit :: neo.Conn () ::: neo.Neo4j
+  => conn
+  clean conn
+  n := neo.transaction conn (tx -> get "nodes-created" (neo.execute tx "CREATE (:Neo4irijTest {k: 1}), (:Neo4irijTest {k: 2})" {}))
+  assert-eq 2 n
+  assert-eq 2 (neo.scalar conn "MATCH (n:Neo4irijTest) RETURN count(n)" {})
+  clean conn
+
+fn create-then-fail :: neo.Tx _ ::: neo.Neo4j
+  => tx
+  neo.execute tx "CREATE (:Neo4irijTest {k: 3})" {}
+  assert-eq 1 (neo.scalar tx "MATCH (n:Neo4irijTest) RETURN count(n)" {})
+  error "abandon"
+
+fn run-transaction-rollback :: neo.Conn () ::: neo.Neo4j
+  => conn
+  clean conn
+  assert-eq "abandon" (caught (-> neo.transaction conn create-then-fail))
+  assert-eq 0 (neo.scalar conn "MATCH (n:Neo4irijTest) RETURN count(n)" {})
+
+fn create-then-bad-cypher :: neo.Tx _ ::: neo.Neo4j
+  => tx
+  neo.execute tx "CREATE (:Neo4irijTest {k: 4})" {}
+  neo.execute tx "CREAT oops" {}
+
+fn run-server-side-failure-in-tx :: neo.Conn () ::: neo.Neo4j
+  => conn
+  clean conn
+  e := caught (-> neo.transaction conn create-then-bad-cypher)
+  assert-eq "Neo.ClientError.Statement.SyntaxError" e.code
+  assert-eq 0 (neo.scalar conn "MATCH (n:Neo4irijTest) RETURN count(n)" {})
+
+fn run-errors :: neo.Conn () ::: neo.Neo4j
+  => conn
+  e1 := caught (-> neo.query conn "MATC (n) RETURN n" {})
+  assert-eq "Neo.ClientError.Statement.SyntaxError" e1.code
+  assert-eq 400 e1.status
+  e2 := caught (-> neo.execute (neo.read-only conn) "CREATE (:Neo4irijTest)" {})
+  assert-eq "Neo.ClientError.Statement.AccessMode" e2.code
+  e3 := caught (-> neo.query (neo.use-database conn "no-such-db") "RETURN 1" {})
+  assert-eq "Neo.ClientError.Database.DatabaseNotFound" e3.code
+  e4 := caught (-> neo.query conn "RETURN $missing AS x" {})
+  assert-true (starts-with? e4.code "Neo.ClientError.Statement.")
+
+fn run-bookmarks :: neo.Conn () ::: neo.Neo4j
+  => conn
+  r := neo.run conn "CREATE (n:Neo4irijTest) RETURN elementId(n) AS i" {}
+  assert-true (length r.bookmarks > 0)
+  after := neo.with-bookmarks conn r.bookmarks
+  assert-true (neo.scalar after "MATCH (n:Neo4irijTest) RETURN count(n) > 0" {})
+  clean conn
+
+fn live :: neo.Conn Fn Fn ::: JVM
+  (conn f -> (-> with http.default-http do (with neo.default-neo4j do (f conn))))
+
+uri := get-env "NEO4J_URI"
+skip := uri == () || uri == ""
+if skip
+  println "  [skip] NEO4J_URI not set — live tests skipped"
+conn := if skip (neo.connect {}) else (with env.default-env do (neo.connect-env ()))
+
+results := if skip
+  #[]
+else
+  #[
+    (test "info"                                 (live conn run-info))
+    (test "parameters round-trip"                (live conn run-params-round-trip))
+    (test "temporal/spatial round-trip"          (live conn run-tagged-round-trip))
+    (test "nodes, relationships, paths"          (live conn run-graph-entities))
+    (test "transaction commits"                  (live conn run-transaction-commit))
+    (test "transaction rolls back on error"      (live conn run-transaction-rollback))
+    (test "server-side failure inside a tx"      (live conn run-server-side-failure-in-tx))
+    (test "Neo4j errors surface as Neo4jError"   (live conn run-errors))
+    (test "bookmarks"                            (live conn run-bookmarks))
+  ]
+
+summarize results

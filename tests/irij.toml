@@ -1,0 +1,3 @@
+# Test dependencies — points at the parent for in-repo development.
+[seeds]
+neo4irij = { path = ".." }

@@ -1,0 +1,212 @@
+use std.test {assert-eq assert-true assert-false test summarize}
+use std.http :as http
+use neo4irij :as neo
+
+;; default-neo4j against a scripted Http handler: what it sends, and
+;; what it makes of the replies. No server involved.
+
+;; Requests the handler saw, oldest first, and replies still to give.
+sent :! #[]
+script :! #[]
+
+fn reply :: Int Str Map
+  (status body -> {status= status body= body headers= {}})
+
+fn reply-h :: Int Str Map Map
+  (status body headers -> {status= status body= body headers= headers})
+
+handler scripted-http :: http.Http
+  http-request opts =>
+    sent <- sent ++ #[opts]
+    next := head script
+    script <- tail script
+    resume next
+
+fn arrange :: Vec ()
+  => replies
+  sent <- #[]
+  script <- replies
+
+fn nth-sent :: Int Map
+  (i -> nth i sent)
+
+conn := neo.connect {url= "http://db.test:7474/" user= "neo4j" password= "secret"}
+
+ok-one := "{\"data\":{\"fields\":[\"n\"],\"values\":[[{\"$type\":\"Integer\",\"_value\":\"1\"}]]},\"bookmarks\":[\"bm1\"]}"
+
+fn run-request-shape :: () () ::: http.Http JVM
+  =>
+  arrange #[(reply 202 ok-one)]
+  with neo.default-neo4j
+    neo.query conn "RETURN $x AS n" {x= 1}
+  req := nth-sent 0
+  assert-eq "POST" req.method
+  assert-eq "http://db.test:7474/db/neo4j/query/v2" req.url
+  assert-eq "application/vnd.neo4j.query" (get "Content-Type" req.headers)
+  assert-eq "application/vnd.neo4j.query" (get "Accept" req.headers)
+  assert-eq "Basic bmVvNGo6c2VjcmV0" (get "Authorization" req.headers)
+  body := json-parse req.body
+  assert-eq "RETURN $x AS n" (get "statement" body)
+  assert-eq {x= {"$type"= "Integer" "_value"= "1"}} (get "parameters" body)
+  assert-eq true (get "includeCounters" body)
+  assert-false (contains? body "accessMode")
+  assert-false (contains? body "bookmarks")
+
+fn run-session-opts :: () () ::: http.Http JVM
+  =>
+  arrange #[(reply 202 ok-one)]
+  c := neo.impersonate (neo.with-bookmarks (neo.read-only (neo.use-database conn "my db")) #["bm0"]) "jo"
+  with neo.default-neo4j
+    neo.query c "RETURN 1 AS n" {}
+  req := nth-sent 0
+  assert-eq "http://db.test:7474/db/my%20db/query/v2" req.url
+  body := json-parse req.body
+  assert-eq "READ" (get "accessMode" body)
+  assert-eq #["bm0"] (get "bookmarks" body)
+  assert-eq "jo" (get "impersonatedUser" body)
+
+fn run-bearer-and-none :: () () ::: http.Http JVM
+  =>
+  arrange #[(reply 202 ok-one) (reply 202 ok-one)]
+  with neo.default-neo4j
+    neo.query (neo.connect {token= "t0k"}) "RETURN 1 AS n" {}
+    neo.query (neo.connect {}) "RETURN 1 AS n" {}
+  assert-eq "Bearer t0k" (get "Authorization" (nth-sent 0).headers)
+  assert-false (contains? (nth-sent 1).headers "Authorization")
+
+fn run-result :: () () ::: http.Http JVM
+  =>
+  body := "{\"data\":{\"fields\":[\"a\",\"b\"],\"values\":[[{\"$type\":\"String\",\"_value\":\"x\"},{\"$type\":\"Null\",\"_value\":null}],[{\"$type\":\"String\",\"_value\":\"y\"},{\"$type\":\"Float\",\"_value\":\"2.5\"}]]},\"counters\":{\"containsUpdates\":true,\"nodesCreated\":2},\"notifications\":[{\"code\":\"N\"}],\"bookmarks\":[\"bm9\"]}"
+  arrange #[(reply 202 body)]
+  r := with neo.default-neo4j do (neo.run conn "…" {})
+  assert-eq #["a" "b"] r.fields
+  assert-eq #[{a= "x" b= ()} {a= "y" b= 2.5}] r.records
+  assert-eq {contains-updates= true nodes-created= 2} r.counters
+  assert-eq #["bm9"] r.bookmarks
+  assert-eq "N" (get "code" (head r.notifications))
+
+fn run-helpers :: () () ::: http.Http JVM
+  =>
+  empty := "{\"data\":{\"fields\":[\"n\"],\"values\":[]}}"
+  write := "{\"data\":{\"fields\":[],\"values\":[]},\"counters\":{\"nodesCreated\":1}}"
+  arrange #[(reply 202 ok-one) (reply 202 ok-one) (reply 202 empty) (reply 202 empty) (reply 202 write)]
+  with neo.default-neo4j
+    assert-eq {n= 1} (neo.single conn "q" {})
+    assert-eq 1 (neo.scalar conn "q" {})
+    assert-eq () (neo.single conn "q" {})
+    assert-eq () (neo.scalar conn "q" {})
+    assert-eq 1 (get "nodes-created" (neo.execute conn "q" {}))
+
+fn caught :: Fn _ ::: http.Http JVM
+  => thunk
+  match (try thunk)
+    Ok v => error ~ "expected a failure, got " ++ to-str v
+    Err e => e
+
+fn run-neo4j-error :: () () ::: http.Http JVM
+  =>
+  err := "{\"errors\":[{\"code\":\"Neo.ClientError.Statement.SyntaxError\",\"message\":\"Invalid input 'MATC'\"}]}"
+  arrange #[(reply 400 err)]
+  e := caught (-> with neo.default-neo4j do (neo.query conn "MATC (n) RETURN n" {}))
+  assert-eq (neo.Neo4jError 400 "Neo.ClientError.Statement.SyntaxError" "Invalid input 'MATC'") e
+  assert-false (neo.transient? e)
+
+fn run-http-error :: () () ::: http.Http JVM
+  =>
+  arrange #[(reply 502 "<html>Bad Gateway</html>") (reply 200 "not json")]
+  e1 := caught (-> with neo.default-neo4j do (neo.query conn "RETURN 1" {}))
+  assert-eq "neo4irij.HttpError" e1.code
+  assert-eq 502 e1.status
+  assert-true (neo.transient? e1)
+  e2 := caught (-> with neo.default-neo4j do (neo.query conn "RETURN 1" {}))
+  assert-eq "neo4irij.BadResponse" e2.code
+
+fn run-transaction-commit :: () () ::: http.Http JVM
+  =>
+  begun := "{\"transaction\":{\"id\":\"ab12\",\"expires\":\"2026-01-01T00:00:00Z\"}}"
+  arrange #[(reply-h 202 begun {"Neo4j-Cluster-Affinity"= "srv-2"}) (reply 202 ok-one) (reply 202 "{\"bookmarks\":[\"bmC\"]}")]
+  got := with neo.default-neo4j do (neo.transaction conn (tx -> neo.scalar tx "RETURN 1 AS n" {}))
+  assert-eq 1 got
+  assert-eq 3 (length sent)
+  assert-eq "http://db.test:7474/db/neo4j/query/v2/tx" (nth-sent 0).url
+  assert-eq "http://db.test:7474/db/neo4j/query/v2/tx/ab12" (nth-sent 1).url
+  assert-eq "srv-2" (get "neo4j-cluster-affinity" (nth-sent 1).headers)
+  assert-eq "http://db.test:7474/db/neo4j/query/v2/tx/ab12/commit" (nth-sent 2).url
+  assert-eq "POST" (nth-sent 2).method
+  assert-eq "srv-2" (get "neo4j-cluster-affinity" (nth-sent 2).headers)
+
+fn failing-work :: _ _ ::: neo.Neo4j
+  => tx
+  neo.execute tx "CREATE (:A)" {}
+  error "boom"
+
+fn run-transaction-rollback :: () () ::: http.Http JVM
+  =>
+  begun := "{\"transaction\":{\"id\":\"cd34\"}}"
+  arrange #[(reply 202 begun) (reply 202 ok-one) (reply 200 "{}")]
+  e := caught (-> with neo.default-neo4j do (neo.transaction conn failing-work))
+  assert-eq "boom" e
+  assert-eq 3 (length sent)
+  assert-eq "DELETE" (nth-sent 2).method
+  assert-eq "http://db.test:7474/db/neo4j/query/v2/tx/cd34" (nth-sent 2).url
+
+fn run-begin-carries-session-opts :: () () ::: http.Http JVM
+  =>
+  arrange #[(reply 202 "{\"transaction\":{\"id\":\"x\"}}") (reply 202 ok-one) (reply 202 "{}")]
+  c := neo.read-only conn
+  with neo.default-neo4j
+    neo.transaction c (tx -> neo.query tx "RETURN 1 AS n" {})
+  assert-eq "READ" (get "accessMode" (json-parse (nth-sent 0).body))
+  assert-false (contains? (json-parse (nth-sent 1).body) "accessMode")
+
+fn run-info :: () () ::: http.Http JVM
+  =>
+  arrange #[(reply 200 "{\"neo4j_version\":\"2026.10.0\"}")]
+  i := with neo.default-neo4j do (neo.info conn)
+  assert-eq "2026.10.0" (get "neo4j_version" i)
+  assert-eq "http://db.test:7474/" (nth-sent 0).url
+  assert-eq "GET" (nth-sent 0).method
+
+transient := "{\"errors\":[{\"code\":\"Neo.TransientError.Transaction.DeadlockDetected\",\"message\":\"deadlock\"}]}"
+
+fn run-retry :: () () ::: http.Http JVM Time
+  =>
+  arrange #[(reply 409 transient) (reply 409 transient) (reply 202 ok-one)]
+  n := with neo.default-neo4j do (neo.retry 3 (-> neo.scalar conn "RETURN 1 AS n" {}))
+  assert-eq 1 n
+  assert-eq 3 (length sent)
+
+fn run-retry-gives-up :: () () ::: http.Http JVM Time
+  =>
+  arrange #[(reply 409 transient) (reply 409 transient)]
+  e := caught (-> with neo.default-neo4j do (neo.retry 2 (-> neo.scalar conn "RETURN 1 AS n" {})))
+  assert-eq "Neo.TransientError.Transaction.DeadlockDetected" e.code
+  assert-eq 2 (length sent)
+
+fn run-no-retry-on-client-error :: () () ::: http.Http JVM Time
+  =>
+  arrange #[(reply 400 "{\"errors\":[{\"code\":\"Neo.ClientError.Statement.SyntaxError\",\"message\":\"x\"}]}")]
+  caught (-> with neo.default-neo4j do (neo.retry 5 (-> neo.scalar conn "RETURN" {})))
+  assert-eq 1 (length sent)
+
+fn in-http :: (Fn):eff (Fn):eff ::: eff
+  (f -> (-> with scripted-http do (f ())))
+
+results := #[
+  (test "request: url, headers, typed body"       (in-http run-request-shape))
+  (test "session opts: db, READ, bookmarks, user" (in-http run-session-opts))
+  (test "bearer token and no auth"                (in-http run-bearer-and-none))
+  (test "result: records, counters, bookmarks"    (in-http run-result))
+  (test "single / scalar / execute"               (in-http run-helpers))
+  (test "Neo4j error → Neo4jError"                (in-http run-neo4j-error))
+  (test "HTTP and non-JSON failures"              (in-http run-http-error))
+  (test "transaction commits, echoes affinity"    (in-http run-transaction-commit))
+  (test "transaction rolls back and re-raises"    (in-http run-transaction-rollback))
+  (test "session opts go on begin only"           (in-http run-begin-carries-session-opts))
+  (test "info reads the discovery document"       (in-http run-info))
+  (test "retry recovers from transient errors"    (in-http run-retry))
+  (test "retry gives up after attempts"           (in-http run-retry-gives-up))
+  (test "retry leaves client errors alone"        (in-http run-no-retry-on-client-error))
+]
+
+summarize results

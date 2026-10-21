@@ -1,0 +1,144 @@
+use std.test {assert-eq assert-true assert-throws test summarize}
+use neo4irij :as neo
+use neo4irij.value :as val
+
+;; Typed-JSON codec, no server involved.
+
+fn t :: Str _ Map
+  (kind v -> {"$type"= kind "_value"= v})
+
+fn run-encode-scalars :: () ()
+  =>
+  assert-eq (t "Null" ()) (val.encode ())
+  assert-eq (t "Boolean" true) (val.encode true)
+  assert-eq (t "Integer" "42") (val.encode 42)
+  assert-eq (t "Integer" "9223372036854775807") (val.encode 9223372036854775807)
+  assert-eq (t "Float" "1.5") (val.encode 1.5)
+  assert-eq (t "Float" "0.5") (val.encode 1/2)
+  assert-eq (t "String" "hi") (val.encode "hi")
+  assert-eq (t "String" "gold") (val.encode :gold)
+
+fn run-encode-collections :: () ()
+  =>
+  assert-eq (t "List" #[(t "Integer" "1") (t "String" "a")]) (val.encode #[1 "a"])
+  assert-eq (t "List" #[(t "Integer" "1") (t "Boolean" false)]) (val.encode #(1 false))
+  assert-eq (t "List" #[(t "Integer" "7")]) (val.encode #{7})
+  assert-eq (t "Map" {a= (t "List" #[])}) (val.encode {a= #[]})
+
+fn run-encode-tagged :: () ()
+  =>
+  assert-eq (t "Date" "2024-05-06") (val.encode (neo.date "2024-05-06"))
+  assert-eq (t "OffsetDateTime" "2024-05-06T10:00:00Z") (val.encode (neo.datetime "2024-05-06T10:00:00Z"))
+  assert-eq (t "ZonedDateTime" "2024-05-06T10:00:00+02:00[Europe/Berlin]") (val.encode (neo.datetime "2024-05-06T10:00:00+02:00[Europe/Berlin]"))
+  assert-eq (t "Duration" "P1DT2H") (val.encode (neo.duration "P1DT2H"))
+  assert-eq (t "Point" "SRID=4326;POINT (13.4 52.5)") (val.encode (neo.wgs84 13.4 52.5))
+
+fn run-encode-params :: () ()
+  =>
+  assert-eq {name= (t "String" "Ada") age= (t "Integer" "36")} (val.encode-params {name= "Ada" age= 36})
+
+fn run-encode-rejects-entities :: () ()
+  =>
+  node := neo.Node "4:x:0" #["P"] {}
+  assert-throws (-> val.encode node)
+  assert-throws (-> val.encode (x -> x))
+
+fn run-decode-scalars :: () () ::: JVM
+  =>
+  assert-eq () (val.decode (t "Null" ()))
+  assert-eq true (val.decode (t "Boolean" true))
+  assert-eq 9223372036854775807 (val.decode (t "Integer" "9223372036854775807"))
+  assert-eq 1.5 (val.decode (t "Float" "1.5"))
+  assert-eq "x" (val.decode (t "String" "x"))
+  nan := val.decode (t "Float" "NaN")
+  assert-eq "NaN" (to-str nan)
+  assert-eq "Infinity" (to-str (val.decode (t "Float" "Infinity")))
+
+fn run-decode-nested :: () () ::: JVM
+  =>
+  wire := t "Map" {xs= (t "List" #[(t "Integer" "1") (t "Null" ())])}
+  assert-eq {xs= #[1 ()]} (val.decode wire)
+
+fn run-decode-tagged :: () () ::: JVM
+  =>
+  assert-eq (neo.date "2024-01-02") (val.decode (t "Date" "2024-01-02"))
+  assert-eq (neo.Tagged "Point" "SRID=7203;POINT (1.0 2.0)") (val.decode (t "Point" "SRID=7203;POINT (1.0 2.0)"))
+  assert-eq (neo.Tagged "Vector" "[1,2]") (val.decode (t "Vector" #[1 2]))
+
+fn wire-node :: Str Str Map
+  (id label -> t "Node" {"_element_id"= id "_labels"= #[label] "_properties"= {name= (t "String" label)}})
+
+fn wire-rel :: Str Str Str Map
+  (id from to -> t "Relationship" {"_element_id"= id "_start_node_element_id"= from "_end_node_element_id"= to "_type"= "KNOWS" "_properties"= {since= (t "Integer" "2020")}})
+
+fn run-decode-entities :: () () ::: JVM
+  =>
+  a := val.decode (wire-node "4:x:0" "A")
+  assert-eq (neo.Node "4:x:0" #["A"] {name= "A"}) a
+  assert-eq #["A"] a.labels
+  r := val.decode (wire-rel "5:x:0" "4:x:0" "4:x:1")
+  assert-eq (neo.Rel "5:x:0" "KNOWS" "4:x:0" "4:x:1" {since= 2020}) r
+  p := val.decode (t "Path" #[(wire-node "4:x:0" "A") (wire-rel "5:x:0" "4:x:0" "4:x:1") (wire-node "4:x:1" "B")])
+  assert-eq 2 (length p.nodes)
+  assert-eq #["KNOWS"] (p.rels |> @ (x -> x.type))
+
+fn run-decode-row :: () () ::: JVM
+  =>
+  row := val.decode-row #["n" "name"] #[(t "Integer" "1") (t "String" "Ada")]
+  assert-eq {n= 1 name= "Ada"} row
+
+fn run-round-trip :: () () ::: JVM
+  =>
+  v := {s= "x" i= 3 f= 2.5 b= false l= #[1 #[2]] m= {k= ()} d= (neo.duration "PT1S")}
+  assert-eq v (val.decode (val.encode v))
+
+fn run-kebab :: () ()
+  =>
+  assert-eq "nodes-created" (neo.kebab "nodesCreated")
+  assert-eq "contains-system-updates" (neo.kebab "containsSystemUpdates")
+  assert-eq "plain" (neo.kebab "plain")
+
+fn run-http-url :: () ()
+  =>
+  assert-eq "http://localhost:7474" (neo.http-url "http://localhost:7474/")
+  assert-eq "https://abc.databases.neo4j.io" (neo.http-url "neo4j+s://abc.databases.neo4j.io")
+  assert-eq "https://db.example:7473" (neo.http-url "bolt+s://db.example:7687")
+  assert-eq "http://db.example:7474" (neo.http-url "neo4j://db.example")
+  assert-eq "http://db.example:7474" (neo.http-url "bolt://db.example:7687")
+  assert-eq "http://db.example:8080" (neo.http-url "neo4j://db.example:8080")
+  assert-throws (-> neo.http-url "ftp://nope")
+
+fn run-connect :: () ()
+  =>
+  c := neo.connect {user= "neo4j" password= "pw" database= "movies"}
+  assert-eq "http://localhost:7474" c.url
+  assert-eq "movies" c.database
+  assert-eq #(:basic "neo4j" "pw") c.auth
+  assert-eq "WRITE" c.access-mode
+  assert-eq #(:bearer "tok") (neo.connect {token= "tok" user= "u"}).auth
+  assert-eq #(:none) (neo.connect {user= ""}).auth
+  r := neo.read-only (neo.with-bookmarks (neo.use-database c "other") #["bm"])
+  assert-eq "READ" r.access-mode
+  assert-eq "other" r.database
+  assert-eq #["bm"] r.bookmarks
+  assert-eq "jo" (neo.impersonate c "jo").impersonate
+  assert-eq 500 (neo.with-timeout c 500).timeout-ms
+
+results := #[
+  (test "encode scalars"                       run-encode-scalars)
+  (test "encode Vec, Tuple, Set, Map"          run-encode-collections)
+  (test "encode Tagged temporal/spatial"       run-encode-tagged)
+  (test "encode-params types each value"       run-encode-params)
+  (test "graph entities can't be parameters"   run-encode-rejects-entities)
+  (test "decode scalars incl. NaN, Infinity"   run-decode-scalars)
+  (test "decode nested List/Map"               run-decode-nested)
+  (test "decode unknown kinds to Tagged"       run-decode-tagged)
+  (test "decode Node, Relationship, Path"      run-decode-entities)
+  (test "decode-row keys by field"             run-decode-row)
+  (test "encode/decode round-trip"             run-round-trip)
+  (test "kebab counters keys"                  run-kebab)
+  (test "http-url maps Bolt URIs"              run-http-url)
+  (test "connect + conn modifiers"             run-connect)
+]
+
+summarize results

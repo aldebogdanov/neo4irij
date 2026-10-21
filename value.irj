@@ -1,0 +1,176 @@
+mod neo4irij.value
+
+;; neo4irij.value — Cypher values ⇄ Irij values.
+;;
+;; The Query API speaks *typed JSON* (`application/vnd.neo4j.query`):
+;; every value travels as {"$type": T, "_value": v}. That keeps the
+;; distinctions plain JSON loses — Integer vs Float, a node vs a map
+;; that happens to have an `elementId` key, a Date vs a string — so
+;; both directions are exact.
+;;
+;;   Cypher                 Irij
+;;   ──────────────────     ─────────────────────────────────────
+;;   Null                   ()
+;;   Boolean                Bool
+;;   Integer                Int      (64-bit on the server)
+;;   Float                  Float    (NaN and ±Infinity included)
+;;   String                 Str
+;;   List                   Vec      (sent from Vec, Tuple or Set)
+;;   Map                    Map
+;;   Node                   Node {id labels props}
+;;   Relationship           Rel  {id type start end props}
+;;   Path                   Path {nodes rels}
+;;   Date, Time, Duration,  Tagged {kind text}, e.g.
+;;   Point, Base64, …         Tagged "Date" "2024-05-06"
+;;
+;; A Rational is sent as a Float and a keyword as its name (`:gold` →
+;; "gold"). A Tagged value read from the database can be sent back
+;; unchanged; build new ones with `date`, `datetime`, `duration`,
+;; `point`, `wgs84`, … below.
+
+use std.collection :as coll
+
+;; ── Graph entities ───────────────────────────────────────────────
+
+;; A node. `id` is Neo4j's elementId — stable within one transaction,
+;; not across them (the server may reuse ids after a delete), so key
+;; long-lived references on a property you own.
+pub spec Node
+  id     :: Str
+  labels :: Vec
+  props  :: Map
+
+;; A relationship; `start` and `end` are the elementIds of its nodes.
+pub spec Rel
+  id    :: Str
+  type  :: Str
+  start :: Str
+  end   :: Str
+  props :: Map
+
+;; A path: n0 -r0- n1 -r1- … ; `nodes` has one more entry than `rels`.
+pub spec Path
+  nodes :: Vec
+  rels  :: Vec
+
+;; A value Irij has no own type for: temporal, spatial, duration,
+;; bytes. `kind` is the Query API's $type, `text` its rendering.
+pub spec Tagged
+  kind :: Str
+  text :: Str
+
+;; ── Building Tagged values ───────────────────────────────────────
+
+pub fn date :: Str Tagged
+  (s -> Tagged "Date" s)
+
+pub fn time :: Str Tagged
+  (s -> Tagged "Time" s)
+
+pub fn local-time :: Str Tagged
+  (s -> Tagged "LocalTime" s)
+
+pub fn local-datetime :: Str Tagged
+  (s -> Tagged "LocalDateTime" s)
+
+;; "2024-05-06T10:00:00+02:00" is an OffsetDateTime; with a zone id,
+;; "2024-05-06T10:00:00+02:00[Europe/Berlin]", a ZonedDateTime.
+pub fn datetime :: Str Tagged
+  => s
+  if (index-of s "[" >= 0)
+    Tagged "ZonedDateTime" s
+  else
+    Tagged "OffsetDateTime" s
+
+;; ISO-8601 duration: "P1Y2M3DT4H".
+pub fn duration :: Str Tagged
+  (s -> Tagged "Duration" s)
+
+;; Well-known text with an SRID: "SRID=4326;POINT (13.4 52.5)".
+pub fn point :: Str Tagged
+  (s -> Tagged "Point" s)
+
+;; A WGS-84 geographic point (SRID 4326), longitude first.
+pub fn wgs84 :: _ _ Tagged
+  (lon lat -> Tagged "Point" ("SRID=4326;POINT (" ++ to-str lon ++ " " ++ to-str lat ++ ")"))
+
+;; A byte array, given base64-encoded.
+pub fn bytes :: Str Tagged
+  (b64 -> Tagged "Base64" b64)
+
+;; ── Encoding: Irij → typed JSON ──────────────────────────────────
+
+fn typed :: Str _ Map
+  (t v -> {"$type"= t "_value"= v})
+
+fn keyword-name :: _ Str
+  => k
+  s := to-str k
+  substring s 1 (length s)
+
+pub fn encode :: _ Map
+  => v
+  case (type-of v)
+    "Unit" => typed "Null" ()
+    "Bool" => typed "Boolean" v
+    "Int" => typed "Integer" (to-str v)
+    "Float" => typed "Float" (to-str v)
+    "Rational" => typed "Float" (to-str (v * 1.0))
+    "Str" => typed "String" v
+    "Keyword" => typed "String" (keyword-name v)
+    "Vector" "Tuple" "Set" => typed "List" (@ encode (to-vec v))
+    "Map" => typed "Map" (coll.map-vals encode v)
+    "Tagged" => typed v.kind v.text
+    "Node" "Rel" "Path" => error ~ "neo4irij: a " ++ (type-of v) ++ " cannot be a Cypher parameter; pass its id or properties"
+    other => error ~ "neo4irij: cannot send a " ++ other ++ " as a Cypher parameter"
+
+;; Encode a parameter map: each value typed, the map itself not.
+pub fn encode-params :: Map Map
+  (params -> coll.map-vals encode params)
+
+;; ── Decoding: typed JSON → Irij ──────────────────────────────────
+
+fn decode-float :: Str Float ::: JVM
+  (s -> java.lang.Double/parseDouble s)
+
+fn decode-props :: Map Map ::: JVM
+  (m -> coll.map-vals decode m)
+
+fn decode-node :: Map Node ::: JVM
+  (m -> Node (get "_element_id" m) (get "_labels" m) (decode-props (get "_properties" m)))
+
+fn decode-rel :: Map Rel ::: JVM
+  => m
+  props := decode-props (get "_properties" m)
+  Rel (get "_element_id" m) (get "_type" m) (get "_start_node_element_id" m) (get "_end_node_element_id" m) props
+
+;; The wire form is one alternating list: node, rel, node, …
+fn decode-path :: Vec Path ::: JVM
+  => parts
+  items := @ decode parts
+  Path (items |> /? (x -> type-of x == "Node")) (items |> /? (x -> type-of x == "Rel"))
+
+fn tagged-text :: _ Str
+  (raw -> if (type-of raw == "Str") raw else (json-encode raw))
+
+pub fn decode :: Map _ ::: JVM
+  => v
+  raw := get "_value" v
+  kind := get "$type" v
+  case kind
+    "Null" => ()
+    "Boolean" => raw
+    "String" => raw
+    "Integer" => parse-int raw
+    "Float" => decode-float raw
+    "List" => @ decode raw
+    "Map" => decode-props raw
+    "Node" => decode-node raw
+    "Relationship" => decode-rel raw
+    "Path" => decode-path raw
+    _ => Tagged kind (tagged-text raw)
+
+;; One row of `data.values` as a Map keyed by the result's field names.
+pub fn decode-row :: Vec Vec Map ::: JVM
+  => fields row
+  fold (acc #(k x) -> assoc acc k (decode x)) {} (coll.zip fields row)

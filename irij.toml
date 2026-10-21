@@ -1,0 +1,7 @@
+[project]
+name = "neo4irij"
+version = "0.1"
+description = "Neo4j for Irij — Cypher over the Neo4j Query API as an effect, typed values, transactions"
+author = "aldebogdanov"
+license = "MIT"
+repo = "https://github.com/aldebogdanov/neo4irij"

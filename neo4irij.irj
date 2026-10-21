@@ -1,0 +1,406 @@
+mod neo4irij
+
+;; neo4irij — Neo4j for Irij, over the Neo4j Query API (HTTP, v2).
+;;
+;;   use neo4irij :as neo
+;;   use std.http :as http
+;;
+;;   conn := neo.connect {url= "http://localhost:7474" user= "neo4j" password= "secret"}
+;;
+;;   with http.default-http
+;;     with neo.default-neo4j
+;;       neo.execute conn "CREATE (:Person {name: $name})" {name= "Ada"}
+;;       people := neo.query conn "MATCH (p:Person) RETURN p.name AS name" {}
+;;       ;; people = #[{name= "Ada"}]
+;;
+;; Neo4j is an effect. `default-neo4j` performs its operations over
+;; HTTP through std.http's `Http` effect, so the same code runs against
+;; a mock `Http` handler (canned server replies) or a mock `Neo4j`
+;; handler (canned records) in tests — see tests/.
+;;
+;; Needs a server with the Query API: Neo4j 5.19+ / 202x.x, or Aura.
+
+use std.http :as http
+use std.env :as env
+use std.collection :as coll
+use std.text :as text
+
+pub use neo4irij.value {Node Rel Path Tagged date time local-time local-datetime datetime duration point wgs84 bytes}
+
+use neo4irij.value :as val
+
+;; ── Connection ───────────────────────────────────────────────────
+
+;; Where and as whom to run. Plain data: build with `connect`, adjust
+;; with `use-database`, `read-only`, `with-bookmarks`, `impersonate`,
+;; `with-timeout`. `auth` is #(:basic user password), #(:bearer token)
+;; or #(:none) — it holds the secret, so don't log a Conn.
+pub spec Conn
+  url         :: Str
+  database    :: Str
+  auth        :: _
+  timeout-ms  :: Int
+  access-mode :: Str
+  bookmarks   :: Vec
+  impersonate :: Str
+
+;; An open explicit transaction. `affinity` is the server's
+;; neo4j-cluster-affinity header, echoed on every follow-up request so
+;; a cluster routes them to the member holding the transaction.
+pub spec Tx
+  conn     :: Conn
+  id       :: Str
+  affinity :: Str
+
+;; What one statement returned. `records` are Maps keyed by `fields`;
+;; `counters` uses kebab keys (nodes-created, properties-set, …).
+pub spec QueryResult
+  fields        :: Vec
+  records       :: Vec
+  counters      :: Map
+  bookmarks     :: Vec
+  notifications :: Vec
+
+;; Raised (with `error`) on any failed request. `code` is Neo4j's
+;; status code, e.g. "Neo.ClientError.Statement.SyntaxError"; failures
+;; that never reached Neo4j use "neo4irij.HttpError" or
+;; "neo4irij.BadResponse".
+pub spec Neo4jError
+  status  :: Int
+  code    :: Str
+  message :: Str
+
+fn opt :: Map Str _ _
+  (m k d -> if (contains? m k) (get k m) else d)
+
+fn present? :: Map Str Bool
+  (m k -> contains? m k && opt m k "" /= "")
+
+fn strip-slash :: Str Str
+  => s
+  if (ends-with? s "/")
+    strip-slash (substring s 0 (length s - 1))
+  else
+    s
+
+;; host:port → #(host port); port is "" when absent.
+fn split-port :: Str Tuple
+  => hostport
+  parts := split hostport ":"
+  if (length parts == 2)
+    #((head parts) (last parts))
+  else
+    #(hostport "")
+
+;; Bolt-style URIs (what Aura and most .env files carry) map onto the
+;; HTTP endpoint of the same server: neo4j+s://h → https://h,
+;; neo4j://h → http://h:7474. An explicit Bolt port 7687 becomes the
+;; default HTTP(S) port, 7474 or 7473. http(s):// passes through.
+pub fn http-url :: Str Str
+  => uri
+  cond
+    starts-with? uri "http://" || starts-with? uri "https://" => strip-slash uri
+    starts-with? uri "neo4j+s://" => https-of (substring uri 10 (length uri))
+    starts-with? uri "bolt+s://" => https-of (substring uri 9 (length uri))
+    starts-with? uri "neo4j+ssc://" => https-of (substring uri 12 (length uri))
+    starts-with? uri "bolt+ssc://" => https-of (substring uri 11 (length uri))
+    starts-with? uri "neo4j://" => http-of (substring uri 8 (length uri))
+    starts-with? uri "bolt://" => http-of (substring uri 7 (length uri))
+    _ => error ~ "neo4irij: unsupported URI scheme in " ++ uri
+
+fn https-of :: Str Str
+  => rest
+  #(host port) := split-port (strip-slash rest)
+  cond
+    port == "" => "https://" ++ host
+    port == "7687" => "https://" ++ host ++ ":7473"
+    _ => "https://" ++ host ++ ":" ++ port
+
+fn http-of :: Str Str
+  => rest
+  #(host port) := split-port (strip-slash rest)
+  if (port == "" || port == "7687")
+    "http://" ++ host ++ ":7474"
+  else
+    "http://" ++ host ++ ":" ++ port
+
+;; opts (all optional):
+;;   url        "http://localhost:7474" — http(s):// or a Bolt URI
+;;   user, password   basic auth
+;;   token      bearer token (SSO / OIDC); wins over user/password
+;;   database   "neo4j"
+;;   timeout-ms whole-request deadline; 0 (default) waits
+pub fn connect :: Map Conn
+  => opts
+  auth := cond
+    present? opts "token" => #(:bearer (get "token" opts))
+    present? opts "user" => #(:basic (get "user" opts) (opt opts "password" ""))
+    _ => #(:none)
+  url := http-url (opt opts "url" "http://localhost:7474")
+  Conn url (opt opts "database" "neo4j") auth (opt opts "timeout-ms" 0) "WRITE" #[] ""
+
+;; From the environment, as Neo4j's own tools write it: NEO4J_URI
+;; (or NEO4J_URL), NEO4J_USERNAME, NEO4J_PASSWORD, NEO4J_DATABASE.
+pub fn connect-env :: () Conn ::: env.Env
+  =>
+  uri := env.env-var "NEO4J_URI" (env.env-var "NEO4J_URL" "http://localhost:7474")
+  user := env.env-var "NEO4J_USERNAME" ""
+  password := env.env-var "NEO4J_PASSWORD" ""
+  database := env.env-var "NEO4J_DATABASE" "neo4j"
+  connect {url= uri user= user password= password database= database}
+
+pub fn use-database :: Conn Str Conn
+  (c db -> Conn c.url db c.auth c.timeout-ms c.access-mode c.bookmarks c.impersonate)
+
+;; Route to read replicas / followers; a write in read mode fails with
+;; Neo.ClientError.Statement.AccessMode.
+pub fn read-only :: Conn Conn
+  (c -> Conn c.url c.database c.auth c.timeout-ms "READ" c.bookmarks c.impersonate)
+
+;; Causal consistency: later requests wait until the server has seen
+;; these bookmarks (from a QueryResult or `commit`).
+pub fn with-bookmarks :: Conn Vec Conn
+  (c bms -> Conn c.url c.database c.auth c.timeout-ms c.access-mode bms c.impersonate)
+
+;; Run as another user (needs the IMPERSONATE privilege).
+pub fn impersonate :: Conn Str Conn
+  (c user -> Conn c.url c.database c.auth c.timeout-ms c.access-mode c.bookmarks user)
+
+pub fn with-timeout :: Conn Int Conn
+  (c ms -> Conn c.url c.database c.auth ms c.access-mode c.bookmarks c.impersonate)
+
+;; ── Effect ───────────────────────────────────────────────────────
+
+pub effect Neo4j
+  ;; One statement in its own auto-commit transaction.
+  neo-run      :: Conn Str Map QueryResult
+  ;; Open an explicit transaction.
+  neo-begin    :: Conn Tx
+  ;; One statement inside an open transaction.
+  neo-tx-run   :: Tx Str Map QueryResult
+  ;; Commit; returns the bookmarks the commit produced.
+  neo-commit   :: Tx Vec
+  ;; Roll back.
+  neo-rollback :: Tx ()
+  ;; The server's discovery document (version, edition, endpoints).
+  neo-info     :: Conn Map
+
+pub handler default-neo4j :: Neo4j ::: http.Http JVM
+  neo-run conn stmt params =>
+    resume (run-request conn stmt params)
+  neo-begin conn =>
+    resume (begin-request conn)
+  neo-tx-run tx stmt params =>
+    resume (tx-run-request tx stmt params)
+  neo-commit tx =>
+    resume (commit-request tx)
+  neo-rollback tx =>
+    rollback-request tx
+    resume ()
+  neo-info conn =>
+    resume (info-request conn)
+
+;; ── Wire ─────────────────────────────────────────────────────────
+
+pub media-type := "application/vnd.neo4j.query"
+
+fn base64 :: Str Str ::: JVM
+  (s -> (java.util.Base64/getEncoder ())#encodeToString (s#getBytes "UTF-8"))
+
+fn auth-header :: _ Str ::: JVM
+  #(:basic u p) => "Basic " ++ base64 (u ++ ":" ++ p)
+  #(:bearer t) => "Bearer " ++ t
+  _ => ""
+
+fn request-headers :: Conn Str Map ::: JVM
+  => conn affinity
+  base := {"Content-Type"= media-type "Accept"= media-type}
+  auth := auth-header conn.auth
+  with-auth := if (auth == "") base else (assoc base "Authorization" auth)
+  if (affinity == "") with-auth else (assoc with-auth "neo4j-cluster-affinity" affinity)
+
+fn tx-headers :: Tx Map ::: JVM
+  (tx -> request-headers tx.conn tx.affinity)
+
+fn query-url :: Conn Str
+  (c -> c.url ++ "/db/" ++ percent-encode c.database ++ "/query/v2")
+
+fn tx-url :: Tx Str
+  (tx -> query-url tx.conn ++ "/tx/" ++ percent-encode tx.id)
+
+;; Session-level options: sent with an auto-commit statement or with
+;; the request that opens a transaction, never inside one.
+fn session-opts :: Conn Map Map
+  => conn body
+  b1 := if (empty? conn.bookmarks) body else (assoc body "bookmarks" conn.bookmarks)
+  b2 := if (conn.access-mode == "WRITE") b1 else (assoc b1 "accessMode" conn.access-mode)
+  if (conn.impersonate == "") b2 else (assoc b2 "impersonatedUser" conn.impersonate)
+
+fn statement-body :: Str Map Map
+  (stmt params -> {"statement"= stmt "parameters"= (val.encode-params params) "includeCounters"= true})
+
+fn parse-body :: Str _
+  => body
+  if (text.blank? body)
+    {}
+  else
+    match (try (-> json-parse body))
+      Ok m => m
+      Err _ => ()
+
+fn snippet :: Str Str
+  (s -> if (length s > 200) (substring s 0 200 ++ "…") else s)
+
+fn fail :: Int _ Str _
+  => status parsed raw
+  errs := if (type-of parsed == "Map") (opt parsed "errors" #[]) else #[]
+  if (empty? errs)
+    code := if (status >= 300) "neo4irij.HttpError" else "neo4irij.BadResponse"
+    error (Neo4jError status code ("HTTP " ++ to-str status ++ ": " ++ snippet raw))
+  else
+    msgs := errs |> @ (e -> opt e "message" "")
+    error (Neo4jError status (opt (head errs) "code" "") (join "; " msgs))
+
+;; Send one request; return {body headers} or raise a Neo4jError.
+fn send :: Conn Str Str _ Map Map ::: http.Http
+  => conn method url body headers
+  resp := http.http-request {method= method url= url body= body headers= headers timeout-ms= conn.timeout-ms}
+  parsed := parse-body resp.body
+  ok := resp.status < 300 && type-of parsed == "Map" && empty? (opt parsed "errors" #[])
+  if ok
+    {body= parsed headers= resp.headers}
+  else
+    fail resp.status parsed resp.body
+
+fn to-result :: Map QueryResult ::: JVM
+  => body
+  data := opt body "data" {}
+  fields := opt data "fields" #[]
+  records := opt data "values" #[] |> @ (row -> val.decode-row fields row)
+  counters := coll.map-keys kebab (opt body "counters" {})
+  QueryResult fields records counters (opt body "bookmarks" #[]) (opt body "notifications" #[])
+
+fn header :: Map Str Str
+  => headers name
+  hit := keys headers |> /! (k -> lower-case k == name)
+  if (hit == ()) "" else (get hit headers)
+
+fn run-request :: Conn Str Map QueryResult ::: http.Http JVM
+  => conn stmt params
+  body := session-opts conn (statement-body stmt params)
+  resp := send conn "POST" (query-url conn) (json-encode body) (request-headers conn "")
+  to-result resp.body
+
+fn begin-request :: Conn Tx ::: http.Http JVM
+  => conn
+  resp := send conn "POST" (query-url conn ++ "/tx") (json-encode (session-opts conn {})) (request-headers conn "")
+  info := opt resp.body "transaction" {}
+  Tx conn (opt info "id" "") (header resp.headers "neo4j-cluster-affinity")
+
+fn tx-run-request :: Tx Str Map QueryResult ::: http.Http JVM
+  => tx stmt params
+  resp := send tx.conn "POST" (tx-url tx) (json-encode (statement-body stmt params)) (tx-headers tx)
+  to-result resp.body
+
+fn commit-request :: Tx Vec ::: http.Http JVM
+  => tx
+  resp := send tx.conn "POST" (tx-url tx ++ "/commit") "{}" (tx-headers tx)
+  opt resp.body "bookmarks" #[]
+
+fn rollback-request :: Tx () ::: http.Http JVM
+  => tx
+  send tx.conn "DELETE" (tx-url tx) () (tx-headers tx)
+  ()
+
+;; The discovery document is plain JSON, outside the Query API.
+fn info-request :: Conn Map ::: http.Http
+  => conn
+  resp := send conn "GET" (conn.url ++ "/") () {"Accept"= "application/json"}
+  resp.body
+
+;; nodesCreated → nodes-created
+pub fn kebab :: Str Str
+  => s
+  text.chars s |> @ (c -> if (c == lower-case c) c else ("-" ++ lower-case c)) |> join ""
+
+;; ── Running statements ───────────────────────────────────────────
+;;
+;; Each takes a *target*: a Conn (auto-commit) or a Tx (inside an
+;; explicit transaction), so the same helpers serve both.
+
+pub fn run :: _ Str Map QueryResult ::: Neo4j
+  => target stmt params
+  if (type-of target == "Tx")
+    neo-tx-run target stmt params
+  else
+    neo-run target stmt params
+
+;; All records, as Maps keyed by the RETURN names.
+pub fn query :: _ Str Map Vec ::: Neo4j
+  (target stmt params -> (run target stmt params).records)
+
+;; The first record, or () when there is none.
+pub fn single :: _ Str Map _ ::: Neo4j
+  => target stmt params
+  rows := query target stmt params
+  if (empty? rows) () else (head rows)
+
+;; The first column of the first record, or () when there is none:
+;;   n := neo.scalar conn "MATCH (p:Person) RETURN count(p)" {}
+pub fn scalar :: _ Str Map _ ::: Neo4j
+  => target stmt params
+  r := run target stmt params
+  if (empty? r.records) () else (get (head r.fields) (head r.records))
+
+;; For writes: the update counters (nodes-created, …).
+pub fn execute :: _ Str Map Map ::: Neo4j
+  (target stmt params -> (run target stmt params).counters)
+
+pub fn info :: Conn Map ::: Neo4j
+  (conn -> neo-info conn)
+
+;; ── Transactions ─────────────────────────────────────────────────
+
+;; Run `work tx` in one explicit transaction: commit when it returns,
+;; roll back and re-raise when it fails. Returns what `work` returned.
+;;
+;;   neo.transaction conn (tx ->
+;;     neo.execute tx "MATCH (a:Account {id: $id}) SET a.balance = a.balance - $n" {id= 1 n= 10}
+;;     neo.execute tx "MATCH (a:Account {id: $id}) SET a.balance = a.balance + $n" {id= 2 n= 10})
+pub fn transaction :: Conn (Fn):eff _ ::: Neo4j eff
+  => conn work
+  tx := neo-begin conn
+  outcome := try (-> work tx)
+  match outcome
+    Ok value =>
+      neo-commit tx
+      value
+    Err e =>
+      try (-> neo-rollback tx)
+      error e
+
+;; True for failures worth retrying: Neo.TransientError.* (deadlocks,
+;; leader switches, …) and requests that never reached the server.
+pub fn transient? :: _ Bool
+  => e
+  type-of e == "Neo4jError" && (starts-with? e.code "Neo.TransientError." || (e.code == "neo4irij.HttpError" && e.status >= 500))
+
+;; Call `thunk`; on a transient failure try again, up to `attempts`
+;; times in all, sleeping 100ms, 200ms, 400ms, … in between.
+;;
+;;   neo.retry 5 (-> neo.transaction conn transfer)
+pub fn retry :: Int (Fn):eff _ ::: Time eff
+  => attempts thunk
+  retry-from 1 attempts thunk
+
+fn retry-from :: Int Int (Fn):eff _ ::: Time eff
+  => n attempts thunk
+  outcome := try thunk
+  match outcome
+    Ok value => value
+    Err e =>
+      if (n < attempts && transient? e)
+        sleep (100 * (2 ** (n - 1)))
+        retry-from (n + 1) attempts thunk
+      else
+        error e

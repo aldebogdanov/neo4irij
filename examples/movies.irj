@@ -1,0 +1,49 @@
+;; A tiny movie graph: load, recommend, update in a transaction.
+;;
+;;   docker run -d --rm -p 7474:7474 -e NEO4J_AUTH=neo4j/password123 neo4j:latest
+;;   NEO4J_URI=http://localhost:7474 NEO4J_USERNAME=neo4j NEO4J_PASSWORD=password123 \
+;;     irij movies.irj
+;;
+;; Uses only nodes labelled :Demo and removes them at the end.
+
+use std.http :as http
+use std.env :as env
+use neo4irij :as neo
+
+seed := "UNWIND $people AS p "
+  ++ "MERGE (a:Demo:Person {name: p.name}) "
+  ++ "WITH a, p UNWIND p.liked AS title "
+  ++ "MERGE (m:Demo:Movie {title: title}) "
+  ++ "MERGE (a)-[:LIKED {at: $today}]->(m)"
+
+people := #[
+  {name= "Ada" liked= #["Alien" "Arrival" "Heat"]}
+  {name= "Bo" liked= #["Alien" "Arrival" "Solaris"]}
+  {name= "Cy" liked= #["Heat" "Ronin"]}
+]
+
+;; Movies liked by people who share a taste with `name`, best first.
+recommend := "MATCH (me:Demo:Person {name: $name})-[:LIKED]->(:Movie)<-[:LIKED]-(peer)-[:LIKED]->(rec:Movie) "
+  ++ "WHERE NOT (me)-[:LIKED]->(rec) "
+  ++ "RETURN rec.title AS title, count(DISTINCT peer) AS score "
+  ++ "ORDER BY score DESC, title"
+
+fn rename :: neo.Tx _ ::: neo.Neo4j
+  => tx
+  neo.execute tx "MATCH (m:Demo:Movie {title: $old}) SET m.title = $new" {old= "Heat" new= "Heat (1995)"}
+  neo.scalar tx "MATCH (m:Demo:Movie) WHERE m.title STARTS WITH 'Heat' RETURN m.title" {}
+
+conn := with env.default-env do (neo.connect-env ())
+
+with http.default-http
+  with neo.default-neo4j
+    println ("Neo4j " ++ get "neo4j_version" (neo.info conn))
+    made := neo.execute conn seed {people= people today= (neo.date "2026-10-21")}
+    println ("created " ++ to-str (get "nodes-created" made) ++ " nodes, " ++ to-str (get "relationships-created" made) ++ " relationships")
+    for-ada := neo.query conn recommend {name= "Ada"}
+    println "for Ada:"
+    for-ada |> @ (r -> println ("  " ++ r.title ++ " (" ++ to-str r.score ++ ")"))
+    println ("renamed to " ++ neo.transaction conn rename)
+    edge := neo.single conn "MATCH (:Person {name: 'Cy'})-[l:LIKED]->(m:Demo:Movie {title: 'Ronin'}) RETURN l, m" {}
+    println ("Cy liked Ronin on " ++ (get "l" edge).props.at.text)
+    neo.execute conn "MATCH (n:Demo) DETACH DELETE n" {}
