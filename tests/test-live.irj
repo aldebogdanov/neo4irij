@@ -121,7 +121,7 @@ fn run-bookmarks :: neo.Conn () ::: neo.Neo4j
   assert-true (neo.scalar after "MATCH (n:Neo4irijTest) RETURN count(n) > 0" {})
   clean conn
 
-fn live :: neo.Conn Fn Fn ::: JVM
+fn live :: neo.Conn Fn Fn ::: http.Http
   (conn f -> (-> with http.default-http do (with neo.default-neo4j do (f conn))))
 
 uri := get-env "NEO4J_URI"

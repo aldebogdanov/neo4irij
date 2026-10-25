@@ -13,12 +13,16 @@ with http.default-http
   with neo.default-neo4j
     neo.execute conn "CREATE (:Person {name: $name, born: $born})" {name= "Ada" born= (neo.date "1815-12-10")}
     people := neo.query conn "MATCH (p:Person) RETURN p.name AS name, p.born AS born" {}
-    ;; #[{name= "Ada" born= Tagged {kind= Date text= 1815-12-10}}]
+    ;; #[{name= "Ada" born= Tagged {kind= "Date" text= "1815-12-10"}}]
 ```
 
 - **Effect, not a client object.** `Neo4j` is an effect; `default-neo4j`
   speaks HTTP through std.http's `Http` effect. Swap either handler in
   tests: canned server replies, or canned records, no database needed.
+- **No Java.** neo4irij is pure Irij over std.http, so nothing that uses it
+  declares `JVM`: queries need `::: neo.Neo4j`, and a function that
+  installs the real handler (`default-neo4j :: Neo4j ::: http.Http`)
+  declares `::: http.Http`. `irij audit` finds no Java in it.
 - **Exact values both ways.** Uses typed JSON (`application/vnd.neo4j.query`),
   so Integer and Float stay apart, nodes don't look like maps, and dates,
   durations and points round-trip.

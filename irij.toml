@@ -5,3 +5,8 @@ description = "Neo4j for Irij — Cypher over the Neo4j Query API as an effect, 
 author = "aldebogdanov"
 license = "MIT"
 repo = "https://github.com/aldebogdanov/neo4irij"
+
+[trust]
+# neo4irij reaches the network only through std.http: no Java of its own.
+caps = []
+jvm = []

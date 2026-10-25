@@ -185,7 +185,7 @@ pub effect Neo4j
   ;; The server's discovery document (version, edition, endpoints).
   neo-info     :: Conn Map
 
-pub handler default-neo4j :: Neo4j ::: http.Http JVM
+pub handler default-neo4j :: Neo4j ::: http.Http
   neo-run conn stmt params =>
     resume (run-request conn stmt params)
   neo-begin conn =>
@@ -204,22 +204,53 @@ pub handler default-neo4j :: Neo4j ::: http.Http JVM
 
 pub media-type := "application/vnd.neo4j.query"
 
-fn base64 :: Str Str ::: JVM
-  (s -> (java.util.Base64/getEncoder ())#encodeToString (s#getBytes "UTF-8"))
+;; Base64 (RFC 4648, padded) of a Str's UTF-8 bytes — for Basic auth.
+;; Pure Irij, so nothing here needs JVM.
+fn base64 :: Str Str
+  (s -> b64 (utf8-bytes s))
 
-fn auth-header :: _ Str ::: JVM
+b64-alphabet := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+fn b64 :: Vec Str
+  #[] => ""
+  #[a] => b64-quad a 0 0 2
+  #[a b] => b64-quad a b 0 3
+  #[a b c ...rest] => b64-quad a b c 4 ++ b64 rest
+
+;; Three bytes as four Base64 characters: the first `keep` are data,
+;; the rest `=` padding.
+fn b64-quad :: Int Int Int Int Str
+  => a b c keep
+  n := a * 65536 + b * 256 + c
+  sextets := #[(quo n 262144) (rem (quo n 4096) 64) (rem (quo n 64) 64) (rem n 64)]
+  sextets |> @i (i x -> if (i < keep) (char-at b64-alphabet x) else "=") |> join ""
+
+;; percent-encode writes a Str as UTF-8: unreserved ASCII as itself,
+;; every other byte as %XX — so its output spells out the bytes.
+fn utf8-bytes :: Str Vec
+  (s -> pct-bytes (split (percent-encode s) ""))
+
+fn pct-bytes :: Vec Vec
+  #[] => #[]
+  #["%" hi lo ...rest] => #[(hex-digit hi * 16 + hex-digit lo)] ++ pct-bytes rest
+  #[c ...rest] => #[(char-code c)] ++ pct-bytes rest
+
+fn hex-digit :: Str Int
+  (h -> index-of "0123456789ABCDEF" h)
+
+fn auth-header :: _ Str
   #(:basic u p) => "Basic " ++ base64 (u ++ ":" ++ p)
   #(:bearer t) => "Bearer " ++ t
   _ => ""
 
-fn request-headers :: Conn Str Map ::: JVM
+fn request-headers :: Conn Str Map
   => conn affinity
   base := {"Content-Type"= media-type "Accept"= media-type}
   auth := auth-header conn.auth
   with-auth := if (auth == "") base else (assoc base "Authorization" auth)
   if (affinity == "") with-auth else (assoc with-auth "neo4j-cluster-affinity" affinity)
 
-fn tx-headers :: Tx Map ::: JVM
+fn tx-headers :: Tx Map
   (tx -> request-headers tx.conn tx.affinity)
 
 fn query-url :: Conn Str
@@ -272,7 +303,7 @@ fn send :: Conn Str Str _ Map Map ::: http.Http
   else
     fail resp.status parsed resp.body
 
-fn to-result :: Map QueryResult ::: JVM
+fn to-result :: Map QueryResult
   => body
   data := opt body "data" {}
   fields := opt data "fields" #[]
@@ -285,29 +316,29 @@ fn header :: Map Str Str
   hit := keys headers |> /! (k -> lower-case k == name)
   if (hit == ()) "" else (get hit headers)
 
-fn run-request :: Conn Str Map QueryResult ::: http.Http JVM
+fn run-request :: Conn Str Map QueryResult ::: http.Http
   => conn stmt params
   body := session-opts conn (statement-body stmt params)
   resp := send conn "POST" (query-url conn) (json-encode body) (request-headers conn "")
   to-result resp.body
 
-fn begin-request :: Conn Tx ::: http.Http JVM
+fn begin-request :: Conn Tx ::: http.Http
   => conn
   resp := send conn "POST" (query-url conn ++ "/tx") (json-encode (session-opts conn {})) (request-headers conn "")
   info := opt resp.body "transaction" {}
   Tx conn (opt info "id" "") (header resp.headers "neo4j-cluster-affinity")
 
-fn tx-run-request :: Tx Str Map QueryResult ::: http.Http JVM
+fn tx-run-request :: Tx Str Map QueryResult ::: http.Http
   => tx stmt params
   resp := send tx.conn "POST" (tx-url tx) (json-encode (statement-body stmt params)) (tx-headers tx)
   to-result resp.body
 
-fn commit-request :: Tx Vec ::: http.Http JVM
+fn commit-request :: Tx Vec ::: http.Http
   => tx
   resp := send tx.conn "POST" (tx-url tx ++ "/commit") "{}" (tx-headers tx)
   opt resp.body "bookmarks" #[]
 
-fn rollback-request :: Tx () ::: http.Http JVM
+fn rollback-request :: Tx () ::: http.Http
   => tx
   send tx.conn "DELETE" (tx-url tx) () (tx-headers tx)
   ()
