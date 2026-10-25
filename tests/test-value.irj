@@ -43,7 +43,7 @@ fn run-encode-rejects-entities :: () ()
   assert-throws (-> val.encode node)
   assert-throws (-> val.encode (x -> x))
 
-fn run-decode-scalars :: () () ::: JVM
+fn run-decode-scalars :: () ()
   =>
   assert-eq () (val.decode (t "Null" ()))
   assert-eq true (val.decode (t "Boolean" true))
@@ -53,13 +53,16 @@ fn run-decode-scalars :: () () ::: JVM
   nan := val.decode (t "Float" "NaN")
   assert-eq "NaN" (to-str nan)
   assert-eq "Infinity" (to-str (val.decode (t "Float" "Infinity")))
+  assert-eq "-Infinity" (to-str (val.decode (t "Float" "-Infinity")))
+  assert-eq 1.0E10 (val.decode (t "Float" "1.0E10"))
+  assert-eq 4.9E-324 (val.decode (t "Float" "4.9E-324"))
 
-fn run-decode-nested :: () () ::: JVM
+fn run-decode-nested :: () ()
   =>
   wire := t "Map" {xs= (t "List" #[(t "Integer" "1") (t "Null" ())])}
   assert-eq {xs= #[1 ()]} (val.decode wire)
 
-fn run-decode-tagged :: () () ::: JVM
+fn run-decode-tagged :: () ()
   =>
   assert-eq (neo.date "2024-01-02") (val.decode (t "Date" "2024-01-02"))
   assert-eq (neo.Tagged "Point" "SRID=7203;POINT (1.0 2.0)") (val.decode (t "Point" "SRID=7203;POINT (1.0 2.0)"))
@@ -71,7 +74,7 @@ fn wire-node :: Str Str Map
 fn wire-rel :: Str Str Str Map
   (id from to -> t "Relationship" {"_element_id"= id "_start_node_element_id"= from "_end_node_element_id"= to "_type"= "KNOWS" "_properties"= {since= (t "Integer" "2020")}})
 
-fn run-decode-entities :: () () ::: JVM
+fn run-decode-entities :: () ()
   =>
   a := val.decode (wire-node "4:x:0" "A")
   assert-eq (neo.Node "4:x:0" #["A"] {name= "A"}) a
@@ -82,12 +85,12 @@ fn run-decode-entities :: () () ::: JVM
   assert-eq 2 (length p.nodes)
   assert-eq #["KNOWS"] (p.rels |> @ (x -> x.type))
 
-fn run-decode-row :: () () ::: JVM
+fn run-decode-row :: () ()
   =>
   row := val.decode-row #["n" "name"] #[(t "Integer" "1") (t "String" "Ada")]
   assert-eq {n= 1 name= "Ada"} row
 
-fn run-round-trip :: () () ::: JVM
+fn run-round-trip :: () ()
   =>
   v := {s= "x" i= 3 f= 2.5 b= false l= #[1 #[2]] m= {k= ()} d= (neo.duration "PT1S")}
   assert-eq v (val.decode (val.encode v))

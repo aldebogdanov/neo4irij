@@ -130,22 +130,28 @@ pub fn encode-params :: Map Map
 
 ;; ── Decoding: typed JSON → Irij ──────────────────────────────────
 
-fn decode-float :: Str Float ::: JVM
-  (s -> java.lang.Double/parseDouble s)
+;; Neo4j writes a Float as Java's Double.toString does; parse-float reads
+;; all of it but the three non-finite values, which come from the math
+;; builtins (no JVM needed).
+fn decode-float :: Str Float
+  "NaN" => sqrt (-1.0)
+  "Infinity" => exp 1000.0
+  "-Infinity" => 0.0 - exp 1000.0
+  s => parse-float s
 
-fn decode-props :: Map Map ::: JVM
+fn decode-props :: Map Map
   (m -> coll.map-vals decode m)
 
-fn decode-node :: Map Node ::: JVM
+fn decode-node :: Map Node
   (m -> Node (get "_element_id" m) (get "_labels" m) (decode-props (get "_properties" m)))
 
-fn decode-rel :: Map Rel ::: JVM
+fn decode-rel :: Map Rel
   => m
   props := decode-props (get "_properties" m)
   Rel (get "_element_id" m) (get "_type" m) (get "_start_node_element_id" m) (get "_end_node_element_id" m) props
 
 ;; The wire form is one alternating list: node, rel, node, …
-fn decode-path :: Vec Path ::: JVM
+fn decode-path :: Vec Path
   => parts
   items := @ decode parts
   Path (items |> /? (x -> type-of x == "Node")) (items |> /? (x -> type-of x == "Rel"))
@@ -153,7 +159,7 @@ fn decode-path :: Vec Path ::: JVM
 fn tagged-text :: _ Str
   (raw -> if (type-of raw == "Str") raw else (json-encode raw))
 
-pub fn decode :: Map _ ::: JVM
+pub fn decode :: Map _
   => v
   raw := get "_value" v
   kind := get "$type" v
@@ -171,6 +177,6 @@ pub fn decode :: Map _ ::: JVM
     _ => Tagged kind (tagged-text raw)
 
 ;; One row of `data.values` as a Map keyed by the result's field names.
-pub fn decode-row :: Vec Vec Map ::: JVM
+pub fn decode-row :: Vec Vec Map
   => fields row
   fold (acc #(k x) -> assoc acc k (decode x)) {} (coll.zip fields row)
