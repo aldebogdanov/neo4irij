@@ -2,13 +2,17 @@ use std.test {assert-eq assert-true test summarize}
 use std.http :as http
 use std.env :as env
 use neo4irij :as neo
+use neo4irij.bolt :as bolt
 
-;; Against a real server. Skipped unless NEO4J_URI is set, e.g.
+;; Against a real server, every scenario over HTTP and again over Bolt.
+;; Skipped unless NEO4J_URI is set, e.g.
 ;;
-;;   docker run -d --rm -p 7474:7474 -e NEO4J_AUTH=neo4j/password123 neo4j:latest
+;;   docker run -d --rm -p 7474:7474 -p 7687:7687 -e NEO4J_AUTH=neo4j/password123 neo4j:latest
 ;;   NEO4J_URI=http://localhost:7474 NEO4J_USERNAME=neo4j NEO4J_PASSWORD=password123 irij test
 ;;
-;; Writes only nodes labelled :Neo4irijTest, and deletes them.
+;; NEO4J_BOLT_URI names the Bolt endpoint when it isn't NEO4J_URI's
+;; host at port 7687. Writes only nodes labelled :Neo4irijTest, and
+;; deletes them.
 
 fn clean :: neo.Conn () ::: neo.Neo4j
   => conn
@@ -105,7 +109,7 @@ fn run-errors :: neo.Conn () ::: neo.Neo4j
   => conn
   e1 := caught (-> neo.query conn "MATC (n) RETURN n" {})
   assert-eq "Neo.ClientError.Statement.SyntaxError" e1.code
-  assert-eq 400 e1.status
+  assert-true (e1.status == 400 || e1.status == 0)
   e2 := caught (-> neo.execute (neo.read-only conn) "CREATE (:Neo4irijTest)" {})
   assert-eq "Neo.ClientError.Statement.AccessMode" e2.code
   e3 := caught (-> neo.query (neo.use-database conn "no-such-db") "RETURN 1" {})
@@ -121,8 +125,76 @@ fn run-bookmarks :: neo.Conn () ::: neo.Neo4j
   assert-true (neo.scalar after "MATCH (n:Neo4irijTest) RETURN count(n) > 0" {})
   clean conn
 
+fn run-bytes :: neo.Conn () ::: neo.Neo4j
+  => conn
+  b := neo.bytes "AQID/w=="
+  assert-eq b (neo.scalar conn "RETURN $v AS v" {v= b})
+  assert-eq 4 (neo.scalar conn "RETURN size($v) AS v" {v= b})
+
+fn run-concurrent :: neo.Conn () ::: neo.Neo4j
+  => conn
+  clean conn
+  neo.execute conn "UNWIND range(1, 20) AS i CREATE (:Neo4irijTest {i: i})" {}
+  sums := par (a b c -> #[a b c]) (-> neo.scalar conn "MATCH (n:Neo4irijTest) RETURN sum(n.i)" {}) (-> neo.scalar conn "MATCH (n:Neo4irijTest) WHERE n.i <= 10 RETURN sum(n.i)" {}) (-> neo.scalar conn "MATCH (n:Neo4irijTest) RETURN count(n)" {})
+  assert-eq #[210 55 20] sums
+  clean conn
+
 fn live :: neo.Conn Fn Fn ::: http.Http
   (conn f -> (-> with http.default-http do (with neo.default-neo4j do (f conn))))
+
+fn live-bolt :: neo.Conn Fn Fn ::: neo.Neo4j
+  (conn f -> (-> with bolt.neo4j do (f conn)))
+
+;; ── Bolt only ────────────────────────────────────────────────────
+
+fn read-both :: neo.Conn Str _ ::: http.Http neo.Neo4j
+  => conn cypher
+  over-http := with http.default-http do (with neo.default-neo4j do (neo.single conn cypher {}))
+  over-bolt := with bolt.neo4j do (neo.single conn cypher {})
+  #(over-http over-bolt)
+
+;; One server, two transports, the same values — down to the text of
+;; each temporal, spatial and duration value.
+fn run-same-values :: neo.Conn () ::: http.Http neo.Neo4j
+  => conn
+  cypher := "RETURN 1 AS i, 1.5 AS f, 'é' AS s, true AS b, null AS n, [1, [2, 'x']] AS l, {k: {j: 1}} AS m, "
+    ++ "date('2024-05-06') AS d, time('10:00:00.5+01:00') AS t, localtime('10:00') AS lt, "
+    ++ "localdatetime('2024-05-06T10:00:00.873') AS ldt, datetime('2024-05-06T10:00:00Z') AS o, "
+    ++ "datetime('2024-05-06T10:00:00+02:00[Europe/Berlin]') AS z, "
+    ++ "duration('P1Y2M3DT4H5M6.5S') AS d1, duration('PT0S') AS d2, duration('-P1DT1H') AS d3, duration('PT-0.5S') AS d4, "
+    ++ "point({x: 1, y: 2}) AS p2, point({x: 1, y: 2, z: 3}) AS p3, point({longitude: 13.4, latitude: 52.5}) AS geo"
+  #(h b) := read-both conn cypher
+  keys h |> @ (k -> assert-eq (get k h) (get k b))
+  assert-eq (length (keys h)) (length (keys b))
+
+fn run-same-entities :: neo.Conn () ::: http.Http neo.Neo4j
+  => conn
+  with bolt.neo4j do (clean conn)
+  with bolt.neo4j do (neo.execute conn "CREATE (:Neo4irijTest:Person {name: 'Ada', born: date('1815-12-10')})-[:KNOWS {since: 1843}]->(:Neo4irijTest {name: 'Charles'})" {})
+  #(h b) := read-both conn "MATCH p = (a:Neo4irijTest {name: 'Ada'})-[r]->(c) RETURN a, r, c, p"
+  assert-eq h b
+  with bolt.neo4j do (clean conn)
+
+fn run-bolt-failures :: neo.Conn () ::: neo.Neo4j
+  => conn
+  wrong := neo.connect {url= conn.url bolt-url= conn.bolt user= "neo4j" password= "not-the-password"}
+  e1 := caught (-> with bolt.neo4j do (neo.query wrong "RETURN 1" {}))
+  assert-eq "Neo.ClientError.Security.Unauthorized" e1.code
+  assert-eq 0 e1.status
+  with bolt.neo4j do (neo.close wrong)
+  nowhere := neo.connect {bolt-url= "neo4j://localhost:1"}
+  e2 := caught (-> with bolt.neo4j do (neo.query nowhere "RETURN 1" {}))
+  assert-eq "neo4irij.Unavailable" e2.code
+  assert-true (neo.transient? e2)
+  with bolt.neo4j do (neo.close nowhere)
+
+fn run-close-and-reopen :: neo.Conn () ::: neo.Neo4j
+  => conn
+  with bolt.neo4j
+    assert-eq 1 (neo.scalar conn "RETURN 1" {})
+    neo.close conn
+    neo.close conn
+    assert-eq 2 (neo.scalar conn "RETURN 2" {})
 
 uri := get-env "NEO4J_URI"
 skip := uri == () || uri == ""
@@ -130,19 +202,33 @@ if skip
   println "  [skip] NEO4J_URI not set — live tests skipped"
 conn := if skip (neo.connect {}) else (with env.default-env do (neo.connect-env ()))
 
+;; Every scenario, once per transport.
+scenarios := #[
+  #("info"                                 run-info)
+  #("parameters round-trip"                run-params-round-trip)
+  #("temporal/spatial round-trip"          run-tagged-round-trip)
+  #("bytes round-trip"                     run-bytes)
+  #("nodes, relationships, paths"          run-graph-entities)
+  #("transaction commits"                  run-transaction-commit)
+  #("transaction rolls back on error"      run-transaction-rollback)
+  #("server-side failure inside a tx"      run-server-side-failure-in-tx)
+  #("Neo4j errors surface as Neo4jError"   run-errors)
+  #("bookmarks"                            run-bookmarks)
+  #("concurrent statements"                run-concurrent)
+]
+
 results := if skip
   #[]
 else
-  #[
-    (test "info"                                 (live conn run-info))
-    (test "parameters round-trip"                (live conn run-params-round-trip))
-    (test "temporal/spatial round-trip"          (live conn run-tagged-round-trip))
-    (test "nodes, relationships, paths"          (live conn run-graph-entities))
-    (test "transaction commits"                  (live conn run-transaction-commit))
-    (test "transaction rolls back on error"      (live conn run-transaction-rollback))
-    (test "server-side failure inside a tx"      (live conn run-server-side-failure-in-tx))
-    (test "Neo4j errors surface as Neo4jError"   (live conn run-errors))
-    (test "bookmarks"                            (live conn run-bookmarks))
+  over-http := scenarios |> @ (#(name f) -> test ("[http] " ++ name) (live conn f))
+  over-bolt := scenarios |> @ (#(name f) -> test ("[bolt] " ++ name) (live-bolt conn f))
+  bolt-only := #[
+    (test "[both] same values over HTTP and Bolt"     (-> run-same-values conn))
+    (test "[both] same nodes, rels, paths"            (-> run-same-entities conn))
+    (test "[bolt] bad password, no server"            (-> run-bolt-failures conn))
+    (test "[bolt] close, then a new driver"           (-> run-close-and-reopen conn))
   ]
+  with bolt.neo4j do (neo.close conn)
+  over-http ++ over-bolt ++ bolt-only
 
 summarize results

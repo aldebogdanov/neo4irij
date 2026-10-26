@@ -1,2 +1,9 @@
 [seeds]
 neo4irij = { path = ".." }
+
+# movies.irj runs over Bolt too: the seed's Java driver and its Java
+# provider, bound by neo4irij.bolt.
+[trust]
+jars = ["neo4irij"]
+java = ["neo4irij"]
+caps = ["neo4irij.bolt"]

@@ -1,12 +1,20 @@
 [project]
 name = "neo4irij"
 version = "0.1"
-description = "Neo4j for Irij — Cypher over the Neo4j Query API as an effect, typed values, transactions"
+description = "Neo4j for Irij — Cypher as an effect over the Query API (HTTP) or Bolt, typed values, transactions"
 author = "aldebogdanov"
 license = "MIT"
 repo = "https://github.com/aldebogdanov/neo4irij"
 
+[jvm]
+# Bolt (neo4irij.bolt): Neo4j's official driver, the shaded build —
+# its Netty and Reactor are relocated, so they can't clash with another
+# library's on the program's one classpath.
+"org.neo4j.driver:neo4j-java-driver-all" = "6.3.0"
+
 [trust]
-# neo4irij reaches the network only through std.http: no Java of its own.
-caps = []
+# The HTTP modules (neo4irij, neo4irij.value) reach the network only
+# through std.http. neo4irij.bolt binds this seed's own Java provider
+# (java/neo4irij/bolt/Bolt.java) with a cap; no Java is written by hand.
+caps = ["neo4irij.bolt"]
 jvm = []

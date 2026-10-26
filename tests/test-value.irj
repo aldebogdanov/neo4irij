@@ -111,10 +111,26 @@ fn run-http-url :: () ()
   assert-eq "http://db.example:8080" (neo.http-url "neo4j://db.example:8080")
   assert-throws (-> neo.http-url "ftp://nope")
 
+fn run-bolt-url :: () ()
+  =>
+  assert-eq "neo4j://localhost:7687" (neo.bolt-url "neo4j://localhost:7687/")
+  assert-eq "bolt+s://db.example" (neo.bolt-url "bolt+s://db.example")
+  assert-eq "neo4j+s://abc.databases.neo4j.io" (neo.bolt-url "https://abc.databases.neo4j.io")
+  assert-eq "neo4j+s://db.example" (neo.bolt-url "https://db.example:7473")
+  assert-eq "neo4j://db.example" (neo.bolt-url "http://db.example:7474")
+  assert-throws (-> neo.bolt-url "ftp://nope")
+
 fn run-connect :: () ()
   =>
   c := neo.connect {user= "neo4j" password= "pw" database= "movies"}
   assert-eq "http://localhost:7474" c.url
+  assert-eq "neo4j://localhost" c.bolt
+  aura := neo.connect {url= "neo4j+s://abc.databases.neo4j.io"}
+  assert-eq "https://abc.databases.neo4j.io" aura.url
+  assert-eq "neo4j+s://abc.databases.neo4j.io" aura.bolt
+  both := neo.connect {url= "http://localhost:17474" bolt-url= "neo4j://localhost:17687"}
+  assert-eq "http://localhost:17474" both.url
+  assert-eq "neo4j://localhost:17687" both.bolt
   assert-eq "movies" c.database
   assert-eq #(:basic "neo4j" "pw") c.auth
   assert-eq "WRITE" c.access-mode
@@ -126,6 +142,7 @@ fn run-connect :: () ()
   assert-eq #["bm"] r.bookmarks
   assert-eq "jo" (neo.impersonate c "jo").impersonate
   assert-eq 500 (neo.with-timeout c 500).timeout-ms
+  assert-eq c.bolt (neo.read-only (neo.with-timeout c 500)).bolt
 
 results := #[
   (test "encode scalars"                       run-encode-scalars)
@@ -141,6 +158,7 @@ results := #[
   (test "encode/decode round-trip"             run-round-trip)
   (test "kebab counters keys"                  run-kebab)
   (test "http-url maps Bolt URIs"              run-http-url)
+  (test "bolt-url maps HTTP URLs"              run-bolt-url)
   (test "connect + conn modifiers"             run-connect)
 ]
 

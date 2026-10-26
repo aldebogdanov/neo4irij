@@ -1,0 +1,108 @@
+use std.test {assert-eq assert-true assert-false assert-throws test summarize}
+use neo4irij :as neo
+use neo4irij.value :as val
+use neo4irij.bolt :as bolt
+
+;; neo4irij.bolt without a server: the Java provider's codec, through a
+;; cap of our own on the same class, and the Irij side's helpers. Over a
+;; server: test-live.irj.
+
+effect Probe
+  round-trip :: Map Map
+  run-at :: Map Map
+
+cap provider :: Probe = "neo4irij.bolt.Bolt"
+
+handler java-probe :: Probe ::: Probe
+  round-trip typed => resume (provider.roundTrip typed)
+  run-at target => resume (provider.run target {database= "neo4j" mode= "WRITE" bookmarks= #[] impersonate= ""} "RETURN 1" {} 0)
+
+;; A value through the driver's own types and back, decoded as over HTTP.
+fn through :: _ _ ::: Probe
+  (v -> val.decode (bolt.ok (round-trip (val.encode v))))
+
+fn run-scalars ::: Probe
+  =>
+  #[42 9223372036854775807 1.5 "hé" true () #[1 "a" #[2]] {k= 2 xs= #[()]}]
+    |> @ (v -> assert-eq v (through v))
+  assert-eq 0.5 (through 1/2)
+  assert-eq "gold" (through :gold)
+  assert-eq #[1 2] (through #(1 2))
+
+fn run-non-finite ::: Probe
+  =>
+  assert-eq "NaN" (to-str (through (sqrt (-1.0))))
+  assert-eq "Infinity" (to-str (through (exp 1000.0)))
+
+fn run-temporals ::: Probe
+  =>
+  #[(neo.date "2024-05-06") (neo.time "10:00:00.5+01:00") (neo.local-time "10:00:00")
+    (neo.local-datetime "2024-05-06T10:00:00.873") (neo.datetime "2024-05-06T10:00:00Z")
+    (neo.datetime "2024-05-06T10:00:00+02:00[Europe/Berlin]")]
+    |> @ (v -> assert-eq v (through v))
+
+;; The texts are Neo4j's own, as the Query API writes them.
+fn run-durations ::: Probe
+  =>
+  #["P1Y2M3DT4H5M6.5S" "PT0S" "P-1DT-1H" "PT1H30M" "P1Y1M" "PT-0.5S" "PT-1.5S" "PT0.000000001S"]
+    |> @ (s -> assert-eq (neo.duration s) (through (neo.duration s)))
+  assert-eq (neo.duration "P14D") (through (neo.duration "P2W"))
+  assert-eq (neo.duration "P1Y2M3DT4H5M6.5S") (through (neo.duration "P14M3DT14706.5S"))
+
+fn run-points-and-bytes ::: Probe
+  =>
+  #[(neo.point "SRID=4326;POINT (13.4 52.5)") (neo.point "SRID=7203;POINT (1.0 2.0)")
+    (neo.point "SRID=9157;POINT Z (1.0 2.0 3.0)") (neo.wgs84 13.4 52.5) (neo.bytes "AQID/w==")]
+    |> @ (v -> assert-eq v (through v))
+
+fn run-refusals ::: Probe
+  =>
+  e1 := match (try (-> through (neo.Tagged "Vector" "[1]")))
+    Err e => e
+    Ok _ => ()
+  assert-eq "neo4irij.BoltError" e1.code
+  assert-throws (-> through (2 ** 64))
+
+fn run-unreachable ::: Probe
+  =>
+  r := run-at (bolt.target (neo.connect {bolt-url= "neo4j://localhost:1"}))
+  e := match (try (-> bolt.ok r))
+    Err x => x
+    Ok _ => ()
+  assert-eq (neo.Neo4jError 0 "neo4irij.Unavailable" (get "message" (get "error" r))) e
+  assert-true (neo.transient? e)
+
+fn run-target-and-session :: () ()
+  =>
+  c := neo.connect {url= "neo4j+s://h.example" user= "u" password= "p" database= "movies"}
+  assert-eq {uri= "neo4j+s://h.example" scheme= "basic" user= "u" password= "p"} (bolt.target c)
+  assert-eq {uri= "neo4j://localhost" scheme= "bearer" token= "t"} (bolt.target (neo.connect {token= "t"}))
+  assert-eq {uri= "neo4j://localhost" scheme= "none"} (bolt.target (neo.connect {}))
+  s := bolt.session (neo.impersonate (neo.with-bookmarks (neo.read-only c) #["bm"]) "jo")
+  assert-eq {database= "movies" mode= "READ" bookmarks= #["bm"] impersonate= "jo"} s
+
+fn run-ok :: () ()
+  =>
+  assert-eq 1 (bolt.ok {ok= 1})
+  assert-eq () (bolt.ok {ok= ()})
+  e := match (try (-> bolt.ok {error= {code= "Neo.ClientError.X" message= "m"}}))
+    Err x => x
+    Ok _ => ()
+  assert-eq (neo.Neo4jError 0 "Neo.ClientError.X" "m") e
+
+fn probed :: Fn Fn ::: Probe
+  (f -> (-> with java-probe do (f ())))
+
+results := #[
+  (test "Int, Float, Str, Bool, null, List, Map"   (probed run-scalars))
+  (test "NaN and Infinity"                         (probed run-non-finite))
+  (test "temporals, as the Query API writes them"  (probed run-temporals))
+  (test "durations in Neo4j's text"                (probed run-durations))
+  (test "points and bytes"                         (probed run-points-and-bytes))
+  (test "what Bolt can't send"                     (probed run-refusals))
+  (test "no server: neo4irij.Unavailable"          (probed run-unreachable))
+  (test "target and session from a Conn"           run-target-and-session)
+  (test "ok unwraps or raises"                     run-ok)
+]
+
+summarize results
