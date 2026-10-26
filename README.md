@@ -1,7 +1,8 @@
 # neo4irij
 
 Neo4j for [Irij](https://irij.online): Cypher as an effect, over the
-[Neo4j Query API](https://neo4j.com/docs/query-api/current/) (HTTP, v2).
+[Neo4j Query API](https://neo4j.com/docs/query-api/current/) (HTTP, v2)
+or over Bolt with Neo4j's official Java driver.
 
 ```irij
 use std.http :as http
@@ -17,12 +18,15 @@ with http.default-http
 ```
 
 - **Effect, not a client object.** `Neo4j` is an effect; `default-neo4j`
-  speaks HTTP through std.http's `Http` effect. Swap either handler in
-  tests: canned server replies, or canned records, no database needed.
-- **No Java.** neo4irij is pure Irij over std.http, so nothing that uses it
-  declares `JVM`: queries need `::: neo.Neo4j`, and a function that
-  installs the real handler (`default-neo4j :: Neo4j ::: http.Http`)
-  declares `::: http.Http`. `irij audit` finds no Java in it.
+  speaks HTTP through std.http's `Http` effect, `neo4irij.bolt`'s `neo4j`
+  speaks Bolt. Your code doesn't change with the transport, and in tests
+  you swap in canned server replies or canned records, no database needed.
+- **No `JVM` in your rows.** The HTTP side is pure Irij over std.http: a
+  function that installs `default-neo4j :: Neo4j ::: http.Http` declares
+  `::: http.Http`. Bolt's driver work is Java the seed ships in `java/`,
+  bound with a `cap`, so `bolt.neo4j :: Neo4j ::: Neo4j` and a function
+  installing it declares `::: neo.Neo4j` — the resource it touches, not
+  "anything". `irij audit` finds one cap and no hand-written Java.
 - **Exact values both ways.** Uses typed JSON (`application/vnd.neo4j.query`),
   so Integer and Float stay apart, nodes don't look like maps, and dates,
   durations and points round-trip.
@@ -30,19 +34,37 @@ with http.default-http
   bookmarks for causal consistency, read routing, impersonation, and
   retry of transient errors.
 
-Needs a server with the Query API: Neo4j 5.19 or later (including the
-202x.x calendar releases), or Aura. Tested against Neo4j 2026.10.
+Over HTTP it needs a server with the Query API: Neo4j 5.19 or later
+(including the 202x.x calendar releases), or Aura. Bolt works with any
+server the driver (6.3) supports. Tested against Neo4j 2026.10.
 
 ## Install
 
 ```toml
 [seeds]
 neo4irij = "0.1"
+
+[trust]
+jars = ["neo4irij"]        # the seed brings the Bolt driver, used or not
+java = ["neo4irij"]        # …and its Java provider, compiled from java/
+caps = ["neo4irij.bolt"]   # only if you use Bolt: it binds the provider
 ```
+
+neo4irij lists the Bolt driver (`org.neo4j.driver:neo4j-java-driver-all`,
+one shaded jar of about 6 MB plus `reactive-streams`) in its `[jvm]`, and
+ships `java/neo4irij/bolt/Bolt.java`, which Irij compiles against it (once;
+the jar is cached in `~/.irij/java`). Both come with the seed whichever
+transport you use. A project with a `[trust]` section — which
+`irij build` and `irij publish` require — names the seed under `jars` and
+`java`, or Irij refuses it before downloading or compiling anything; one
+without `[trust]` gets a warning from `irij run`. A project that uses Bolt
+also lets `neo4irij.bolt` bind the provider with `caps`. Compiling needs
+a JDK, as Irij itself does.
 
 ```irij
 use neo4irij :as neo
-use std.http :as http
+use std.http :as http          ;; over HTTP
+use neo4irij.bolt :as bolt     ;; over Bolt
 ```
 
 ## Connecting
@@ -55,12 +77,23 @@ conn := with env.default-env do (neo.connect-env ())   ;; NEO4J_URI, NEO4J_USERN
 ```
 
 `connect` options, all optional: `url` (default `http://localhost:7474`),
-`user` + `password`, `token` (wins over user/password), `database`
-(default `neo4j`), `timeout-ms` (whole-request deadline; `0` waits).
+`bolt-url`, `user` + `password`, `token` (wins over user/password),
+`database` (default `neo4j`), `timeout-ms` (a deadline per request, or per
+transaction over Bolt; `0` waits).
 
-`url` may be the Bolt URI your `.env` already has: `neo4j+s://h` and
-`bolt+s://h` become `https://h`, `neo4j://h` and `bolt://h` become
-`http://h:7474`, and an explicit Bolt port `7687` becomes 7473 / 7474.
+One `Conn` serves both transports: it keeps the server's HTTP endpoint
+(`conn.url`) and its Bolt URI (`conn.bolt`), both worked out from `url`:
+
+| `url` | HTTP | Bolt |
+|---|---|---|
+| `http://h:7474` | `http://h:7474` | `neo4j://h` (port 7687) |
+| `https://h` | `https://h` | `neo4j+s://h` |
+| `neo4j+s://h`, `bolt+s://h` | `https://h` | as given |
+| `neo4j://h`, `bolt://h` | `http://h:7474` | as given |
+
+An explicit Bolt port `7687` maps to HTTP's 7473 / 7474. When Bolt
+listens somewhere else, say so with `bolt-url` (or `NEO4J_BOLT_URI` for
+`connect-env`): `neo.connect {url= "http://h:17474" bolt-url= "neo4j://h:17687"}`.
 
 A `Conn` is plain data. Adjust it with:
 
@@ -87,7 +120,8 @@ Parameters are a Map; refer to them as `$name`.
 | `scalar target cypher params` | the first column of the first record, or `()` |
 | `execute target cypher params` | the update counters: `{nodes-created= 1 properties-set= 2 …}` |
 | `run target cypher params` | the whole `QueryResult` |
-| `info conn` | the server's discovery document (`neo4j_version`, `neo4j_edition`, …) |
+| `info conn` | the server's `neo4j_version` and `neo4j_edition` (over HTTP its whole discovery document) |
+| `close conn` | over Bolt, closes the Conn's driver and connections; nothing over HTTP |
 
 ```irij
 n     := neo.scalar conn "MATCH (p:Person) RETURN count(p)" {}
@@ -148,13 +182,56 @@ fn transfer :: neo.Tx _ ::: neo.Neo4j
 neo.transaction conn transfer
 ```
 
-The server rolls back a transaction left idle too long (a minute on a
-default server); each statement extends it. In a cluster, the `neo4j-cluster-affinity` header
-the server returns is sent back on every request of the transaction.
+Over HTTP the server rolls back a transaction left idle too long (a
+minute on a default server); each statement extends it. In a cluster, the
+`neo4j-cluster-affinity` header the server returns is sent back on every
+request of the transaction. Over Bolt a transaction holds a session, and
+its connection, until it commits or rolls back.
 
 The effect's operations are there for finer control: `neo-begin conn`,
 `neo-tx-run tx cypher params`, `neo-commit tx` (returns bookmarks),
-`neo-rollback tx`.
+`neo-rollback tx`, `neo-close conn`.
+
+## Bolt
+
+```irij
+use neo4irij :as neo
+use neo4irij.bolt :as bolt
+
+conn := neo.connect {url= "neo4j+s://abcd1234.databases.neo4j.io" user= "neo4j" password= "…"}
+
+fn people :: neo.Conn Vec ::: neo.Neo4j
+  => conn
+  with bolt.neo4j
+    neo.query conn "MATCH (p:Person) RETURN p.name AS name" {}
+```
+
+`bolt.neo4j` handles the same `Neo4j` effect as `default-neo4j`, so
+everything above — `query` to `retry`, `Conn` adjustments, a fake
+handler in tests — works over Bolt unchanged, and values come back the
+same: the same Ints, Nodes and Rels, and the same `Tagged` text for every
+temporal, spatial and duration value (the live tests read one battery of
+values over both and compare them).
+
+- **How it's built.** `java/neo4irij/bolt/Bolt.java` is a cap provider:
+  static methods over plain values that open sessions, run statements and
+  hold transactions. Values cross in the Query API's typed JSON both
+  ways, so Bolt results are decoded by the same code as HTTP's, and a
+  failure comes back as data with Neo4j's code.
+- **One driver per server and user.** The first statement for a `Conn`'s
+  Bolt URI and credentials creates a driver, which owns a connection pool;
+  later statements, from any fiber, reuse it. `neo.close conn` closes it.
+  A program that exits doesn't have to.
+- **Routing.** A `neo4j://` / `neo4j+s://` URI routes through the cluster:
+  `read-only` sends reads to followers and read replicas. `bolt://` talks
+  to the one server.
+- **Bookmarks.** Each auto-commit statement's `QueryResult.bookmarks` and
+  `commit`'s return value are the session's bookmarks; `with-bookmarks`
+  passes them on, as over HTTP.
+- **Errors** carry the same Neo4j codes as over HTTP, with `status` 0.
+  A server that can't be reached is `neo4irij.Unavailable`, which
+  `transient?` counts; any other driver failure without a Neo4j code is
+  `neo4irij.BoltError`.
 
 ## Errors and retries
 
@@ -164,7 +241,8 @@ A failed request raises (with `error`) a `Neo4jError {status code message}`.
 `Neo.ClientError.Schema.ConstraintValidationFailed`; failures that never
 reached Neo4j are `neo4irij.HttpError` (non-2xx without a Neo4j error
 body, e.g. a proxy's 502) or `neo4irij.BadResponse` (a reply that isn't
-JSON). Connection failures surface as std.http raises them.
+JSON). Over HTTP, connection failures surface as std.http raises them;
+over Bolt they are `neo4irij.Unavailable` (see Bolt).
 
 ```irij
 match (try (-> neo.execute conn "CREATE (:User {email: $e})" {e= email}))
@@ -174,7 +252,7 @@ match (try (-> neo.execute conn "CREATE (:User {email: $e})" {e= email}))
 ```
 
 `transient? e` is true for `Neo.TransientError.*` (deadlocks, leader
-changes, …) and 5xx `neo4irij.HttpError`s. `retry attempts thunk` retries
+changes, …), 5xx `neo4irij.HttpError`s and `neo4irij.Unavailable`. `retry attempts thunk` retries
 those with backoff (100ms, 200ms, 400ms, …) and re-raises anything else:
 
 ```irij
@@ -198,28 +276,35 @@ with fake-neo4j
 ```
 
 Or keep `default-neo4j` and fake the HTTP underneath, which also checks
-the requests it builds — see `tests/test-wire.irj`.
+the requests it builds — see `tests/test-wire.irj`. Either way the code
+under test needs no driver and no `JVM`.
 
 ## Limits
 
-- The Query API returns a result in one response, so a query's whole
-  result is held in memory; page large reads with `SKIP`/`LIMIT` or
-  keyset pagination.
-- HTTP only, no Bolt. One request per statement.
+- A query's whole result is held in memory, over either transport (the
+  Query API returns it in one response; over Bolt the records are
+  collected before `query` returns). Page large reads with
+  `SKIP`/`LIMIT` or keyset pagination.
 - Integers are 64-bit on the server; a larger Irij `Int` is rejected.
+- Over Bolt, a `Tagged` value of a kind the driver has no type for (such
+  as `Vector`) can be read but not sent back.
 
 ## Development
 
-The tests need Irij 0.9.353 or later (they nest inline `with … do`).
+neo4irij needs an Irij with Java sources (`java/`, spec §3.3): the first
+release after 0.11.376.
 
 ```sh
 irij test                    # unit tests; live tests skip without NEO4J_URI
 
-docker run -d --rm -p 7474:7474 -e NEO4J_AUTH=neo4j/password123 neo4j:latest
+docker run -d --rm -p 7474:7474 -p 7687:7687 -e NEO4J_AUTH=neo4j/password123 neo4j:latest
 NEO4J_URI=http://localhost:7474 NEO4J_USERNAME=neo4j NEO4J_PASSWORD=password123 irij test
 ```
 
-`examples/movies.irj` is a small end-to-end tour against the same server.
+The live tests run every scenario over HTTP and again over Bolt
+(`NEO4J_BOLT_URI` when Bolt isn't at port 7687), then compare what both
+transports read. `examples/movies.irj` is a small end-to-end tour against
+the same server; `irij movies.irj bolt` takes it over Bolt.
 
 ## License
 

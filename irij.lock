@@ -1,0 +1,12 @@
+# irij.lock: the Java libraries irij.toml [jvm] resolved to, with their
+# sha256. Written by irij; commit it. A changed [jvm] rewrites it.
+version = 1
+inputs = "52b8b153246e4e649102efb97de0ee39b1b7b67e7d7c4705a7c3b66fcf9ed942"
+
+[[jar]]
+coord = "org.neo4j.driver:neo4j-java-driver-all:jar:6.3.0"
+sha256 = "2d955bb6a65c166b7134c0d91003686f9b550b363e7693c6a494e924ed88914d"
+
+[[jar]]
+coord = "org.reactivestreams:reactive-streams:jar:1.0.4"
+sha256 = "f75ca597789b3dac58f61857b9ac2e1034a68fa672db35055a8fb4509e325f28"

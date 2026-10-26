@@ -1,3 +1,13 @@
 # Test dependencies — points at the parent for in-repo development.
 [seeds]
 neo4irij = { path = ".." }
+
+# What a project using neo4irij over Bolt says: the seed may bring its
+# Java driver (jars) and compile its Java provider (java), and
+# neo4irij.bolt may bind that provider with a cap (caps). HTTP alone
+# needs `jars` and `java` (the seed brings both either way) and no `caps`.
+# "main" is these test files: test-bolt.irj binds the provider directly.
+[trust]
+jars = ["neo4irij"]
+java = ["neo4irij"]
+caps = ["neo4irij.bolt", "main"]

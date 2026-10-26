@@ -1,0 +1,70 @@
+mod neo4irij.bolt
+
+;; neo4irij.bolt — the Neo4j effect over Bolt, with Neo4j's official
+;; Java driver.
+;;
+;;   use neo4irij :as neo
+;;   use neo4irij.bolt :as bolt
+;;
+;;   conn := neo.connect {url= "neo4j://localhost:7687" user= "neo4j" password= "secret"}
+;;
+;;   fn people :: neo.Conn Vec ::: neo.Neo4j
+;;     => conn
+;;     with bolt.neo4j
+;;       neo.query conn "MATCH (p:Person) RETURN p.name AS name" {}
+;;
+;; `neo4j` handles the same `Neo4j` effect as neo4irij's HTTP
+;; `default-neo4j`, so everything built on it — query, single, scalar,
+;; execute, run, transaction, retry, a mock handler in tests — is the
+;; same over either; installing one or the other picks the transport.
+;;
+;; The driver work is Java, in this seed's java/neo4irij/bolt/Bolt.java,
+;; bound with a cap: the handler performs Neo4j, not JVM. Values cross
+;; in the Query API's typed JSON both ways, so neo4irij.value's codec and
+;; neo4irij's `query-result` serve Bolt too, and a value reads the same
+;; over either transport.
+
+use neo4irij :as neo
+use neo4irij.value :as val
+
+cap bolt :: neo.Neo4j = "neo4irij.bolt.Bolt"
+
+pub handler neo4j :: neo.Neo4j ::: neo.Neo4j
+  neo-run conn stmt params =>
+    resume (neo.query-result (ok (bolt.run (target conn) (session conn) stmt (val.encode-params params) conn.timeout-ms)))
+  neo-begin conn =>
+    resume (neo.Tx conn (ok (bolt.begin (target conn) (session conn) conn.timeout-ms)) "")
+  neo-tx-run tx stmt params =>
+    resume (neo.query-result (ok (bolt.txRun tx.id stmt (val.encode-params params))))
+  neo-commit tx =>
+    resume (ok (bolt.commit tx.id))
+  neo-rollback tx =>
+    ok (bolt.rollback tx.id)
+    resume ()
+  neo-info conn =>
+    resume (ok (bolt.info (target conn) (session conn)))
+  neo-close conn =>
+    ok (bolt.close (target conn))
+    resume ()
+
+;; Where and as whom: the Bolt URI and the credentials.
+pub fn target :: neo.Conn Map
+  => conn
+  match conn.auth
+    #(:basic u p) => {uri= conn.bolt scheme= "basic" user= u password= p}
+    #(:bearer t) => {uri= conn.bolt scheme= "bearer" token= t}
+    _ => {uri= conn.bolt scheme= "none"}
+
+;; The session-level options, as the driver's SessionConfig takes them.
+pub fn session :: neo.Conn Map
+  (conn -> {database= conn.database mode= conn.access-mode bookmarks= conn.bookmarks impersonate= conn.impersonate})
+
+;; The provider answers {ok= value} or {error= {code message}}: an
+;; exception thrown into Irij would keep only its message.
+pub fn ok :: Map _
+  => reply
+  if (contains? reply "error")
+    e := get "error" reply
+    error (neo.Neo4jError 0 (get "code" e) (get "message" e))
+  else
+    get "ok" reply

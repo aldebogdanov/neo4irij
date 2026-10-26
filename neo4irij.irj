@@ -1,6 +1,7 @@
 mod neo4irij
 
-;; neo4irij — Neo4j for Irij, over the Neo4j Query API (HTTP, v2).
+;; neo4irij — Neo4j for Irij, over the Neo4j Query API (HTTP, v2) or
+;; Bolt (neo4irij.bolt).
 ;;
 ;;   use neo4irij :as neo
 ;;   use std.http :as http
@@ -16,7 +17,9 @@ mod neo4irij
 ;; Neo4j is an effect. `default-neo4j` performs its operations over
 ;; HTTP through std.http's `Http` effect, so the same code runs against
 ;; a mock `Http` handler (canned server replies) or a mock `Neo4j`
-;; handler (canned records) in tests — see tests/.
+;; handler (canned records) in tests — see tests/. `neo4irij.bolt`'s
+;; handler performs the same operations over Bolt with the official
+;; Java driver; which handler a program installs picks the transport.
 ;;
 ;; Needs a server with the Query API: Neo4j 5.19+ / 202x.x, or Aura.
 
@@ -33,10 +36,13 @@ use neo4irij.value :as val
 
 ;; Where and as whom to run. Plain data: build with `connect`, adjust
 ;; with `use-database`, `read-only`, `with-bookmarks`, `impersonate`,
-;; `with-timeout`. `auth` is #(:basic user password), #(:bearer token)
-;; or #(:none) — it holds the secret, so don't log a Conn.
+;; `with-timeout`. `url` is the server's HTTP endpoint, `bolt` its Bolt
+;; URI; each handler uses its own. `auth` is #(:basic user password),
+;; #(:bearer token) or #(:none) — it holds the secret, so don't log a
+;; Conn.
 pub spec Conn
   url         :: Str
+  bolt        :: Str
   database    :: Str
   auth        :: _
   timeout-ms  :: Int
@@ -64,7 +70,9 @@ pub spec QueryResult
 ;; Raised (with `error`) on any failed request. `code` is Neo4j's
 ;; status code, e.g. "Neo.ClientError.Statement.SyntaxError"; failures
 ;; that never reached Neo4j use "neo4irij.HttpError" or
-;; "neo4irij.BadResponse".
+;; "neo4irij.BadResponse" over HTTP, "neo4irij.Unavailable" or
+;; "neo4irij.BoltError" over Bolt. `status` is the HTTP status; 0 over
+;; Bolt.
 pub spec Neo4jError
   status  :: Int
   code    :: Str
@@ -108,6 +116,26 @@ pub fn http-url :: Str Str
     starts-with? uri "bolt://" => http-of (substring uri 7 (length uri))
     _ => error ~ "neo4irij: unsupported URI scheme in " ++ uri
 
+;; The Bolt URI of the same server. A Bolt URI passes through; https://h
+;; becomes neo4j+s://h and http://h neo4j://h, at Bolt's default port
+;; 7687 — the HTTP port says nothing about the Bolt one, so a server
+;; listening elsewhere needs `bolt-url` in `connect`.
+pub fn bolt-url :: Str Str
+  => uri
+  cond
+    bolt-scheme? uri => strip-slash uri
+    starts-with? uri "https://" => "neo4j+s://" ++ host-only (substring uri 8 (length uri))
+    starts-with? uri "http://" => "neo4j://" ++ host-only (substring uri 7 (length uri))
+    _ => error ~ "neo4irij: unsupported URI scheme in " ++ uri
+
+fn bolt-scheme? :: Str Bool
+  (uri -> #["neo4j://" "neo4j+s://" "neo4j+ssc://" "bolt://" "bolt+s://" "bolt+ssc://"] |> @ (p -> starts-with? uri p) |> /|)
+
+fn host-only :: Str Str
+  => rest
+  #(host _) := split-port (strip-slash rest)
+  host
+
 fn https-of :: Str Str
   => rest
   #(host port) := split-port (strip-slash rest)
@@ -126,6 +154,7 @@ fn http-of :: Str Str
 
 ;; opts (all optional):
 ;;   url        "http://localhost:7474" — http(s):// or a Bolt URI
+;;   bolt-url   the Bolt URI, when `url` can't say it (see bolt-url)
 ;;   user, password   basic auth
 ;;   token      bearer token (SSO / OIDC); wins over user/password
 ;;   database   "neo4j"
@@ -136,38 +165,41 @@ pub fn connect :: Map Conn
     present? opts "token" => #(:bearer (get "token" opts))
     present? opts "user" => #(:basic (get "user" opts) (opt opts "password" ""))
     _ => #(:none)
-  url := http-url (opt opts "url" "http://localhost:7474")
-  Conn url (opt opts "database" "neo4j") auth (opt opts "timeout-ms" 0) "WRITE" #[] ""
+  given := opt opts "url" "http://localhost:7474"
+  bolt := bolt-url (opt opts "bolt-url" given)
+  Conn (http-url given) bolt (opt opts "database" "neo4j") auth (opt opts "timeout-ms" 0) "WRITE" #[] ""
 
 ;; From the environment, as Neo4j's own tools write it: NEO4J_URI
-;; (or NEO4J_URL), NEO4J_USERNAME, NEO4J_PASSWORD, NEO4J_DATABASE.
+;; (or NEO4J_URL), NEO4J_USERNAME, NEO4J_PASSWORD, NEO4J_DATABASE —
+;; and NEO4J_BOLT_URI when the Bolt URI isn't NEO4J_URI's.
 pub fn connect-env :: () Conn ::: env.Env
   =>
   uri := env.env-var "NEO4J_URI" (env.env-var "NEO4J_URL" "http://localhost:7474")
   user := env.env-var "NEO4J_USERNAME" ""
   password := env.env-var "NEO4J_PASSWORD" ""
   database := env.env-var "NEO4J_DATABASE" "neo4j"
-  connect {url= uri user= user password= password database= database}
+  bolt := env.env-var "NEO4J_BOLT_URI" uri
+  connect {url= uri bolt-url= bolt user= user password= password database= database}
 
 pub fn use-database :: Conn Str Conn
-  (c db -> Conn c.url db c.auth c.timeout-ms c.access-mode c.bookmarks c.impersonate)
+  (c db -> Conn c.url c.bolt db c.auth c.timeout-ms c.access-mode c.bookmarks c.impersonate)
 
 ;; Route to read replicas / followers; a write in read mode fails with
 ;; Neo.ClientError.Statement.AccessMode.
 pub fn read-only :: Conn Conn
-  (c -> Conn c.url c.database c.auth c.timeout-ms "READ" c.bookmarks c.impersonate)
+  (c -> Conn c.url c.bolt c.database c.auth c.timeout-ms "READ" c.bookmarks c.impersonate)
 
 ;; Causal consistency: later requests wait until the server has seen
 ;; these bookmarks (from a QueryResult or `commit`).
 pub fn with-bookmarks :: Conn Vec Conn
-  (c bms -> Conn c.url c.database c.auth c.timeout-ms c.access-mode bms c.impersonate)
+  (c bms -> Conn c.url c.bolt c.database c.auth c.timeout-ms c.access-mode bms c.impersonate)
 
 ;; Run as another user (needs the IMPERSONATE privilege).
 pub fn impersonate :: Conn Str Conn
-  (c user -> Conn c.url c.database c.auth c.timeout-ms c.access-mode c.bookmarks user)
+  (c user -> Conn c.url c.bolt c.database c.auth c.timeout-ms c.access-mode c.bookmarks user)
 
 pub fn with-timeout :: Conn Int Conn
-  (c ms -> Conn c.url c.database c.auth ms c.access-mode c.bookmarks c.impersonate)
+  (c ms -> Conn c.url c.bolt c.database c.auth ms c.access-mode c.bookmarks c.impersonate)
 
 ;; ── Effect ───────────────────────────────────────────────────────
 
@@ -182,8 +214,12 @@ pub effect Neo4j
   neo-commit   :: Tx Vec
   ;; Roll back.
   neo-rollback :: Tx ()
-  ;; The server's discovery document (version, edition, endpoints).
+  ;; The server's version and edition: `neo4j_version` and
+  ;; `neo4j_edition` over either transport, plus whatever else it says.
   neo-info     :: Conn Map
+  ;; Let go of what the handler holds for this Conn — Bolt's driver and
+  ;; its connection pool; nothing over HTTP.
+  neo-close    :: Conn ()
 
 pub handler default-neo4j :: Neo4j ::: http.Http
   neo-run conn stmt params =>
@@ -199,6 +235,8 @@ pub handler default-neo4j :: Neo4j ::: http.Http
     resume ()
   neo-info conn =>
     resume (info-request conn)
+  neo-close _ =>
+    resume ()
 
 ;; ── Wire ─────────────────────────────────────────────────────────
 
@@ -303,7 +341,10 @@ fn send :: Conn Str Str _ Map Map ::: http.Http
   else
     fail resp.status parsed resp.body
 
-fn to-result :: Map QueryResult
+;; A Query API response body (data.fields, data.values, counters,
+;; bookmarks, notifications) as a QueryResult. neo4irij.bolt's provider
+;; answers in the same shape, so both transports decode here.
+pub fn query-result :: Map QueryResult
   => body
   data := opt body "data" {}
   fields := opt data "fields" #[]
@@ -320,7 +361,7 @@ fn run-request :: Conn Str Map QueryResult ::: http.Http
   => conn stmt params
   body := session-opts conn (statement-body stmt params)
   resp := send conn "POST" (query-url conn) (json-encode body) (request-headers conn "")
-  to-result resp.body
+  query-result resp.body
 
 fn begin-request :: Conn Tx ::: http.Http
   => conn
@@ -331,7 +372,7 @@ fn begin-request :: Conn Tx ::: http.Http
 fn tx-run-request :: Tx Str Map QueryResult ::: http.Http
   => tx stmt params
   resp := send tx.conn "POST" (tx-url tx) (json-encode (statement-body stmt params)) (tx-headers tx)
-  to-result resp.body
+  query-result resp.body
 
 fn commit-request :: Tx Vec ::: http.Http
   => tx
@@ -390,6 +431,11 @@ pub fn execute :: _ Str Map Map ::: Neo4j
 pub fn info :: Conn Map ::: Neo4j
   (conn -> neo-info conn)
 
+;; Done with a Conn: over Bolt, closes its driver (a later statement
+;; opens a new one). Over HTTP there is nothing to close.
+pub fn close :: Conn () ::: Neo4j
+  (conn -> neo-close conn)
+
 ;; ── Transactions ─────────────────────────────────────────────────
 
 ;; Run `work tx` in one explicit transaction: commit when it returns,
@@ -411,10 +457,11 @@ pub fn transaction :: Conn (Fn):eff _ ::: Neo4j eff
       error e
 
 ;; True for failures worth retrying: Neo.TransientError.* (deadlocks,
-;; leader switches, …) and requests that never reached the server.
+;; leader switches, …) and requests that never reached the server — a
+;; 5xx over HTTP, no reachable server over Bolt.
 pub fn transient? :: _ Bool
   => e
-  type-of e == "Neo4jError" && (starts-with? e.code "Neo.TransientError." || (e.code == "neo4irij.HttpError" && e.status >= 500))
+  type-of e == "Neo4jError" && (starts-with? e.code "Neo.TransientError." || e.code == "neo4irij.Unavailable" || (e.code == "neo4irij.HttpError" && e.status >= 500))
 
 ;; Call `thunk`; on a transient failure try again, up to `attempts`
 ;; times in all, sleeping 100ms, 200ms, 400ms, … in between.
